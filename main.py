@@ -89,7 +89,9 @@ def harvest_loop():
             } for g in games])
 
             if live_games:
-                log(f"{len(live_games)} live verified games", "harvest")
+                log(f"{len(live_games)} live verified games ({len(games)} total)", "harvest")
+            else:
+                log(f"No live games ({len(games)} final)", "harvest")
 
             # Phase 3: Find and execute harvests
             with bank_lock:
@@ -232,7 +234,7 @@ def _trade_dict(pos) -> dict:
 
 
 def _engines():
-    return {"harvest": config.HARVEST_ENABLED, "synth": config.SYNTH_ENABLED and bool(config.SYNTH_API_KEY)}
+    return {"harvest": config.HARVEST_ENABLED, "synth": config.SYNTH_ENABLED}
 
 
 def main():
@@ -265,7 +267,10 @@ def main():
 
     os.makedirs(config.LOG_DIR, exist_ok=True)
     start_api()
-    start_binance_feed()  # Real-time BTC/ETH prices from Binance
+    try:
+        start_binance_feed()
+    except Exception as e:
+        print(f"  [WARN] Binance feed failed to start: {e} — crypto snipe disabled")
     push_state()
     update(engines=_engines())
 
@@ -285,13 +290,14 @@ def main():
         threads.append(t1)
         log("Harvest engine started", "harvest")
 
-    if config.SYNTH_ENABLED and config.SYNTH_API_KEY:
+    if config.SYNTH_ENABLED:
         t2 = threading.Thread(target=synth_loop, daemon=True, name="synth")
         t2.start()
         threads.append(t2)
-        log("Synth engine started", "synth")
-    elif config.SYNTH_ENABLED:
-        log("Synth enabled but no API key — set SYNTH_API_KEY", "synth")
+        if config.SYNTH_API_KEY:
+            log("Crypto engine started (snipe + Synth)", "synth")
+        else:
+            log("Crypto engine started (snipe only — add SYNTH_API_KEY for Synth edge)", "synth")
 
     if not threads:
         log("No engines enabled!")

@@ -51,82 +51,81 @@ def get_eth_price() -> float:
 
 def start_binance_feed():
     """
-    Start WebSocket connections to Binance for real-time BTC and ETH prices.
-    Free, no API key needed. Updates every ~1 second.
-    Also starts a background thread to pre-cache window open prices.
+    Start price feeds for real-time BTC and ETH prices.
+    Tries WebSocket first, falls back to REST polling.
+    NEVER crashes — all errors are caught and retried.
     """
-    def _ws_loop(symbol, state):
-        """Reconnecting WebSocket loop for one symbol."""
-        import websocket
-        url = f"wss://stream.binance.com:9443/ws/{symbol}@ticker"
-
+    def _poll_loop():
+        """REST polling fallback — works everywhere, no special libraries needed."""
         while True:
             try:
-                ws = websocket.WebSocket()
-                ws.connect(url, timeout=10)
-                while True:
-                    msg = ws.recv()
-                    data = json.loads(msg)
+                r = requests.get("https://api.binance.com/api/v3/ticker/price",
+                                 params={"symbol": "BTCUSDT"}, timeout=5)
+                if r.ok:
                     with _price_lock:
-                        state["price"] = float(data.get("c", 0))  # "c" = current price
-                        state["time"] = time.time()
+                        _btc_price["price"] = float(r.json().get("price", 0))
+                        _btc_price["time"] = time.time()
             except Exception:
-                time.sleep(2)  # Reconnect after 2s
+                pass
+            try:
+                r2 = requests.get("https://api.binance.com/api/v3/ticker/price",
+                                  params={"symbol": "ETHUSDT"}, timeout=5)
+                if r2.ok:
+                    with _price_lock:
+                        _eth_price["price"] = float(r2.json().get("price", 0))
+                        _eth_price["time"] = time.time()
+            except Exception:
+                pass
+            time.sleep(3)
 
     def _price_cache_loop():
         """Pre-cache window open prices at each 5-min and 15-min boundary."""
         while True:
-            now = time.time()
-            # Next 5-min boundary
-            next_5m = (int(now) // 300 + 1) * 300
-            sleep_until = next_5m - now + 2  # 2 seconds after window opens
-            if sleep_until > 0:
-                time.sleep(min(sleep_until, 30))  # Don't sleep more than 30s
-            # Cache the price for this new window
-            for asset in ["BTC", "ETH"]:
-                window_ts = int(time.time()) - (int(time.time()) % 300)
-                _get_window_open_price(window_ts, asset)
-                # Also 15-min window
-                window_ts_15 = int(time.time()) - (int(time.time()) % 900)
-                _get_window_open_price(window_ts_15, asset)
+            try:
+                now = time.time()
+                next_5m = (int(now) // 300 + 1) * 300
+                sleep_until = next_5m - now + 2
+                if sleep_until > 0:
+                    time.sleep(min(sleep_until, 30))
+                for asset in ["BTC", "ETH"]:
+                    window_ts = int(time.time()) - (int(time.time()) % 300)
+                    _get_window_open_price(window_ts, asset)
+                    window_ts_15 = int(time.time()) - (int(time.time()) % 900)
+                    _get_window_open_price(window_ts_15, asset)
+            except Exception:
+                time.sleep(10)
 
-    # Try websocket-client library, fall back to polling if not available
     try:
+        # Try WebSocket first (faster, ~1s updates)
         import websocket
-        t1 = threading.Thread(target=_ws_loop, args=("btcusdt", _btc_price), daemon=True)
-        t1.start()
-        t2 = threading.Thread(target=_ws_loop, args=("ethusdt", _eth_price), daemon=True)
-        t2.start()
-        print("  [CRYPTO] Binance WebSocket connected (BTC + ETH)")
-    except ImportError:
-        # Fall back to REST polling
-        def _poll_loop():
+
+        def _ws_loop(symbol, state):
+            url = f"wss://stream.binance.com:9443/ws/{symbol}@ticker"
             while True:
                 try:
-                    r = requests.get("https://api.binance.com/api/v3/ticker/price",
-                                     params={"symbol": "BTCUSDT"}, timeout=5)
-                    if r.ok:
+                    ws = websocket.WebSocket()
+                    ws.connect(url, timeout=10)
+                    while True:
+                        msg = ws.recv()
+                        data = json.loads(msg)
                         with _price_lock:
-                            _btc_price["price"] = float(r.json().get("price", 0))
-                            _btc_price["time"] = time.time()
-
-                    r2 = requests.get("https://api.binance.com/api/v3/ticker/price",
-                                      params={"symbol": "ETHUSDT"}, timeout=5)
-                    if r2.ok:
-                        with _price_lock:
-                            _eth_price["price"] = float(r2.json().get("price", 0))
-                            _eth_price["time"] = time.time()
+                            state["price"] = float(data.get("c", 0))
+                            state["time"] = time.time()
                 except Exception:
-                    pass
-                time.sleep(2)
+                    time.sleep(3)
 
-        t = threading.Thread(target=_poll_loop, daemon=True)
-        t.start()
+        threading.Thread(target=_ws_loop, args=("btcusdt", _btc_price), daemon=True).start()
+        threading.Thread(target=_ws_loop, args=("ethusdt", _eth_price), daemon=True).start()
+        print("  [CRYPTO] Binance WebSocket started (BTC + ETH)")
+    except Exception:
+        # WebSocket not available — use REST polling
+        threading.Thread(target=_poll_loop, daemon=True).start()
         print("  [CRYPTO] Binance REST polling started (BTC + ETH)")
 
+    # Also start REST as backup (in case WebSocket fails silently)
+    threading.Thread(target=_poll_loop, daemon=True).start()
     # Start price cache thread
-    tc = threading.Thread(target=_price_cache_loop, daemon=True)
-    tc.start()
+    threading.Thread(target=_price_cache_loop, daemon=True).start()
     return True
 
 
