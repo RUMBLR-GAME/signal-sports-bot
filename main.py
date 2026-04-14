@@ -170,10 +170,10 @@ def synth_loop():
                 "id": s.id, "asset": s.asset, "timeframe": s.timeframe,
                 "direction": s.direction, "synthProb": s.synth_prob_up,
                 "polyProb": s.poly_prob_up, "edge": s.edge,
-                "edgePct": s.edge_pct, "confidence": s.confidence,
+                "edgePct": round(s.edge * 100, 1), "confidence": s.confidence,
                 "price": s.price, "side": s.side,
-                "eventEnd": s.event_end, "currentPrice": s.current_btc,
-                "shares": s.shares, "cost": s.position_usd,
+                "eventEnd": s.event_end, "currentPrice": 0,
+                "shares": s.shares, "cost": s.cost,
                 "timestamp": s.timestamp,
             } for s in signals])
 
@@ -201,13 +201,14 @@ def synth_loop():
                         detail=sig.detail,
                     )
                 traded += 1
-                log(f"SYNTH {sig.asset} {sig.timeframe} {sig.direction.upper()} @ ${sig.price:.2f} │ Edge:{sig.edge_pct:+.1f}% │ Synth:{sig.synth_prob_up:.1%} vs Poly:{sig.poly_prob_up:.1%}", "synth")
+                edge_pct = round(sig.edge * 100, 1)
+                log(f"SNIPE {sig.asset} {sig.timeframe} {sig.direction.upper()} @ ${sig.price:.2f} │ Edge:{edge_pct:+.1f}% │ Delta:{sig.window_delta_pct:+.3f}%", "synth")
                 add_trade({"id": sig.id, "engine": "synth", "sport": sig.asset,
                            "event": f"{sig.asset} {sig.timeframe}",
                            "outcome": f"{sig.direction.upper()}", "side": sig.side,
                            "entryPrice": sig.price, "shares": sig.shares,
-                           "cost": sig.position_usd, "edge": sig.edge,
-                           "edgePct": sig.edge_pct, "confidence": sig.confidence,
+                           "cost": sig.cost, "edge": sig.edge,
+                           "edgePct": edge_pct, "confidence": sig.confidence,
                            "synthProb": sig.synth_prob_up, "polyProb": sig.poly_prob_up,
                            "timeframe": sig.timeframe, "status": "open",
                            "pnl": None, "timestamp": now.isoformat()})
