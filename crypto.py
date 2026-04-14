@@ -186,7 +186,6 @@ def scan_crypto_opportunities(equity: float, open_crypto_exposure: float) -> lis
 
     # Check 15-minute markets (BTC and ETH)
     for asset, price in [("BTC", btc), ("ETH", eth)]:
-        price = price_fn()
         if price <= 0:
             continue
         sig = _check_15min_market(price, asset, now, equity, remaining)
