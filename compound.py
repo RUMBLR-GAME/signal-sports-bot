@@ -62,6 +62,8 @@ class BankrollManager:
         self.total_trades: int = 0
         self.total_wins: int = 0
         self.total_pnl: float = 0.0
+        self.harvest_count: int = 0
+        self.synth_count: int = 0
         self._load()
 
     # ── Read-only getters ────────────────────────────
@@ -146,6 +148,10 @@ class BankrollManager:
         self.bankroll -= cost
         self.positions.append(pos)
         self.total_trades += 1
+        if kw["engine"] == "harvest":
+            self.harvest_count += 1
+        else:
+            self.synth_count += 1
         self._save()
         return pos
 
@@ -357,8 +363,8 @@ class BankrollManager:
             "harvest_exposure": round(self.get_engine_exposure("harvest"), 2),
             "synth_exposure": round(self.get_engine_exposure("synth"), 2),
             "drawdown": round(dd, 1),
-            "harvest_trades": self.total_trades - s_open,  # Approximate
-            "synth_trades": s_open,
+            "harvest_trades": self.harvest_count,
+            "synth_trades": self.synth_count,
             "archived": len(self.archive),
         }
 
@@ -370,6 +376,7 @@ class BankrollManager:
             "bankroll": self.bankroll, "hwm": self.hwm,
             "total_trades": self.total_trades, "total_wins": self.total_wins,
             "total_pnl": self.total_pnl,
+            "harvest_count": self.harvest_count, "synth_count": self.synth_count,
             "positions": [asdict(p) for p in self.positions],
             "archive_count": len(self.archive),
             "updated": datetime.now(timezone.utc).isoformat(),
@@ -396,6 +403,8 @@ class BankrollManager:
             self.total_trades = state.get("total_trades", 0)
             self.total_wins = state.get("total_wins", 0)
             self.total_pnl = state.get("total_pnl", 0.0)
+            self.harvest_count = state.get("harvest_count", 0)
+            self.synth_count = state.get("synth_count", 0)
             for pd in state.get("positions", []):
                 # Gracefully handle schema changes
                 for key in ("engine", "level", "detail"):

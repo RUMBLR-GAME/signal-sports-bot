@@ -175,14 +175,17 @@ def scan_crypto_opportunities(equity: float, open_crypto_exposure: float) -> lis
     if btc <= 0:
         return []  # No price data yet
 
-    # Check 5-minute BTC markets
-    sig = _check_5min_market(btc, "BTC", now, equity, remaining)
-    if sig:
-        signals.append(sig)
-        remaining -= sig.cost
+    # Check 5-minute markets (BTC and ETH)
+    for asset, price in [("BTC", btc), ("ETH", eth)]:
+        if price <= 0:
+            continue
+        sig = _check_5min_market(price, asset, now, equity, remaining)
+        if sig:
+            signals.append(sig)
+            remaining -= sig.cost
 
-    # Check 15-minute markets (BTC, ETH, SOL)
-    for asset, price_fn in [("BTC", get_btc_price), ("ETH", get_eth_price)]:
+    # Check 15-minute markets (BTC and ETH)
+    for asset, price in [("BTC", btc), ("ETH", eth)]:
         price = price_fn()
         if price <= 0:
             continue
@@ -202,7 +205,7 @@ def scan_crypto_opportunities(equity: float, open_crypto_exposure: float) -> lis
     return signals
 
 
-def _check_5min_market(btc_now: float, asset: str, now: float, equity: float, remaining: float) -> Optional[CryptoSignal]:
+def _check_5min_market(price_now: float, asset: str, now: float, equity: float, remaining: float) -> Optional[CryptoSignal]:
     """
     LAYER 1: 5-minute latency snipe.
     At T-30 to T-5 seconds, check if direction is confirmed.
@@ -221,7 +224,7 @@ def _check_5min_market(btc_now: float, asset: str, now: float, equity: float, re
         return None
 
     # Calculate delta
-    delta_pct = (btc_now - open_price) / open_price * 100
+    delta_pct = (price_now - open_price) / open_price * 100
 
     # Decision thresholds (from the $438K bot research)
     abs_delta = abs(delta_pct)
@@ -261,7 +264,8 @@ def _check_5min_market(btc_now: float, asset: str, now: float, equity: float, re
     else:
         confidence = 0.55
 
-    slug = f"btc-updown-5m-{window_ts}"
+    slug_prefix = "btc" if asset == "BTC" else "eth" if asset == "ETH" else "sol"
+    slug = f"{slug_prefix}-updown-5m-{window_ts}"
     now_dt = datetime.now(timezone.utc)
 
     return CryptoSignal(

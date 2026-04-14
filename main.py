@@ -184,7 +184,7 @@ def synth_loop():
             traded = 0
             for sig in signals:
                 with bank_lock:
-                    ok, reason = bank.can_trade(sig.cost, "", "synth")
+                    ok, reason = bank.can_trade(sig.cost, sig.slug or sig.id, "synth")
                     if not ok:
                         continue
                     # For synth, we need the Polymarket condition_id from the slug
