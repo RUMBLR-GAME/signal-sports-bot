@@ -207,61 +207,55 @@ def scan_crypto_opportunities(equity: float, open_crypto_exposure: float) -> lis
 def _check_5min_market(price_now: float, asset: str, now: float, equity: float, remaining: float) -> Optional[CryptoSignal]:
     """
     LAYER 1: 5-minute latency snipe.
-    At T-30 to T-5 seconds, check if direction is confirmed.
+    ONLY trade when direction is CONFIRMED — high delta, late in window.
+    The $438K bot's secret: at T-10s with 0.10%+ delta, outcome is locked.
     """
     window_ts = int(now) - (int(now) % 300)
     close_time = window_ts + 300
     seconds_left = close_time - now
 
-    # Only trade in the last 30 seconds of the window
-    if seconds_left > 30 or seconds_left < 3:
+    # Only trade in the last 15 seconds — maximum confirmation
+    if seconds_left > 15 or seconds_left < 3:
         return None
 
-    # Get the window's opening price from Binance
     open_price = _get_window_open_price(window_ts, asset)
     if open_price <= 0:
         return None
 
-    # Calculate delta
     delta_pct = (price_now - open_price) / open_price * 100
-
-    # Decision thresholds (from the $438K bot research)
     abs_delta = abs(delta_pct)
-    if abs_delta < 0.02:
-        return None  # Too close to call
+
+    # MINIMUM 0.05% delta — anything less is noise
+    if abs_delta < 0.05:
+        return None
 
     direction = "up" if delta_pct > 0 else "down"
 
-    # Estimate what we'd pay (market makers see the same delta)
+    # Price tiers — only trade at good prices
     if abs_delta >= 0.15:
-        est_price = 0.94  # Nearly certain — expensive
+        est_price = 0.92
     elif abs_delta >= 0.10:
-        est_price = 0.87
+        est_price = 0.85
     elif abs_delta >= 0.05:
-        est_price = 0.75
-    elif abs_delta >= 0.02:
-        est_price = 0.60
+        est_price = 0.72
     else:
-        est_price = 0.52
+        return None  # Should never reach here
 
     implied_return = (1.0 - est_price) / est_price
 
-    # Size position
-    sizing = config.SYNTH_SIZING.get("15min", {})  # Use 15min sizing for 5min too
+    sizing = config.SYNTH_SIZING.get("15min", {})
     pos_usd = min(equity * sizing.get("pct", 0.04), sizing.get("max_usd", 60), remaining)
     shares = int(pos_usd / est_price)
     if shares < config.MIN_SHARES:
         return None
 
-    # Confidence based on delta size and time remaining
-    if abs_delta >= 0.10 and seconds_left <= 15:
-        confidence = 0.98
-    elif abs_delta >= 0.05 and seconds_left <= 20:
-        confidence = 0.92
-    elif abs_delta >= 0.02:
-        confidence = 0.75
+    # Confidence — only high confidence trades
+    if abs_delta >= 0.10:
+        confidence = 0.97
+    elif abs_delta >= 0.05:
+        confidence = 0.88
     else:
-        confidence = 0.55
+        confidence = 0.70
 
     slug_prefix = "btc" if asset == "BTC" else "eth" if asset == "ETH" else "sol"
     slug = f"{slug_prefix}-updown-5m-{window_ts}"
@@ -287,14 +281,16 @@ def _check_5min_market(price_now: float, asset: str, now: float, equity: float, 
 
 def _check_15min_market(price_now: float, asset: str, now: float, equity: float, remaining: float) -> Optional[CryptoSignal]:
     """
-    LAYER 1 for 15-minute markets. Same latency snipe concept.
-    Trade in last 60 seconds when direction is clearer.
+    LAYER 1 for 15-minute markets.
+    STRICTER than 5-min because more time for reversals.
+    Only trade with 0.08%+ delta in last 30 seconds.
     """
     window_ts = int(now) - (int(now) % 900)
     close_time = window_ts + 900
     seconds_left = close_time - now
 
-    if seconds_left > 60 or seconds_left < 5:
+    # Only trade in last 30 seconds — confirmed direction
+    if seconds_left > 30 or seconds_left < 5:
         return None
 
     open_price = _get_window_open_price(window_ts, asset)
@@ -303,21 +299,21 @@ def _check_15min_market(price_now: float, asset: str, now: float, equity: float,
 
     delta_pct = (price_now - open_price) / open_price * 100
     abs_delta = abs(delta_pct)
-    if abs_delta < 0.03:
+
+    # MINIMUM 0.08% delta for 15-min — needs to be decisive
+    if abs_delta < 0.08:
         return None
 
     direction = "up" if delta_pct > 0 else "down"
 
-    if abs_delta >= 0.20:
+    if abs_delta >= 0.25:
         est_price = 0.93
-    elif abs_delta >= 0.10:
-        est_price = 0.82
-    elif abs_delta >= 0.05:
-        est_price = 0.68
-    elif abs_delta >= 0.03:
-        est_price = 0.58
+    elif abs_delta >= 0.15:
+        est_price = 0.85
+    elif abs_delta >= 0.08:
+        est_price = 0.75
     else:
-        est_price = 0.52
+        return None
 
     implied_return = (1.0 - est_price) / est_price
     sizing = config.SYNTH_SIZING.get("15min", {})
@@ -326,7 +322,7 @@ def _check_15min_market(price_now: float, asset: str, now: float, equity: float,
     if shares < config.MIN_SHARES:
         return None
 
-    confidence = min(0.65 + abs_delta * 3, 0.98) if abs_delta >= 0.05 else 0.60
+    confidence = min(0.75 + abs_delta * 1.5, 0.98)
 
     slug_prefix = "btc" if asset == "BTC" else "eth" if asset == "ETH" else "sol"
     slug = f"{slug_prefix}-updown-15m-{window_ts}"
