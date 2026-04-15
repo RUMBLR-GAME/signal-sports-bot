@@ -85,22 +85,31 @@ class PositionManager:
             except Exception:
                 self._redis = None
 
-        # Force reset: clears all state (set FORCE_RESET=true in Railway env vars)
-        if os.getenv("FORCE_RESET", "").lower() == "true":
-            logger.info("🔄 FORCE_RESET: clearing all state")
-            self.positions = {}
-            self.trades = []
+        # ── HARD RESET v4.2 ──────────────────────────────────────
+        # Nuke ALL state everywhere. Positions, trades, Redis, file.
+        # Remove this block after confirmed working.
+        logger.info("🔄 v4.2 HARD RESET — clearing all state")
+        self.positions = {}
+        self.trades = []
+        # Kill Redis state
+        if self._redis_ok:
             try:
-                if self._redis_ok:
-                    await self._redis.delete("signal:state")
-                if os.path.exists(STATE_FILE):
-                    os.remove(STATE_FILE)
+                await self._redis.delete("signal:state")
+                logger.info("  Redis: cleared")
             except Exception:
                 pass
-            await self._save()
-            logger.info("🔄 State reset complete — equity back to starting bankroll")
-        else:
-            await self._restore()
+        # Kill file state
+        for f in [STATE_FILE, "state.json", "/app/state.json", "./state.json"]:
+            try:
+                if os.path.exists(f):
+                    os.remove(f)
+                    logger.info(f"  File: {f} deleted")
+            except Exception:
+                pass
+        # Write fresh empty state to both
+        await self._save()
+        logger.info(f"  Fresh state saved. Equity = ${STARTING_BANKROLL}")
+        # ── END HARD RESET ────────────────────────────────────────
 
         logger.info(f"Positions: {len(self.positions)} open, {len(self.trades)} resolved, equity=${self.equity:.2f}")
 
