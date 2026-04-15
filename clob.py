@@ -1,300 +1,315 @@
 """
 clob.py — Polymarket CLOB Interface
+All orderbook interactions: prices, orders, fills, balance, resolution.
 
-All interactions with the Polymarket orderbook in one place.
-Two modes:
-  - Read-only (no auth): price queries, orderbook data
-  - Authenticated (Level 2): order placement, fill tracking, balance
-
-MAKER ORDERS ONLY. Zero fees + daily USDC rebates.
-Never use taker/market orders (1.80% fee on crypto, 0.75% on sports).
-
-Key gotchas handled:
-  - post_only=True → reject if order would take liquidity
-  - Never call update_balance_allowance() after fills
-  - 500ms delay before balance check post-fill
-  - Rate limiting at 55/min (CLOB limit is 60)
-  - get_tick_size() before every order
+CRITICAL GOTCHAS HANDLED:
+1. get_price() returns dict {"price": "0.85"}, NOT float
+2. Uses create_order + post_order separately (NOT create_and_post_order)
+3. post_only=True on every order
+4. NEVER calls update_balance_allowance()
+5. 500ms delay after fill before reading balance
+6. Rate limited to 55 orders/min
+7. get_tick_size() before every order
 """
 
-import time
 import json
 import logging
-import threading
+import time
 from typing import Optional
-from dataclasses import dataclass, asdict
 
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import (
-    OrderArgs, OrderType, PartialCreateOrderOptions,
-    OpenOrderParams, TradeParams, BalanceAllowanceParams,
+import aiohttp
+
+from config import (
+    CLOB_HOST, GAMMA_API, CHAIN_ID, PAPER_MODE,
+    POLYMARKET_PRIVATE_KEY, POLYMARKET_FUNDER_ADDRESS,
+    SIGNATURE_TYPE, MAX_ORDERS_PER_MINUTE,
+    SPORT_TAG_SLUGS, FUTURES_BLOCK,
 )
-from py_clob_client.order_builder.constants import BUY, SELL
-
-import config
 
 logger = logging.getLogger("clob")
 
-# ── Rate limiting ────────────────────────────────
-_order_times: list[float] = []
-_rate_lock = threading.Lock()
 
+class ClobInterface:
+    """Wraps py-clob-client with safe defaults and error handling."""
 
-def _rate_ok() -> bool:
-    with _rate_lock:
-        now = time.time()
-        _order_times[:] = [t for t in _order_times if now - t < 60]
-        if len(_order_times) >= config.RATE_LIMIT_PER_MIN:
+    def __init__(self):
+        self._client = None
+        self._authenticated = False
+        self._order_timestamps: list[float] = []
+        self._initialized = False
+        self._http_session: Optional[aiohttp.ClientSession] = None
+
+    def initialize(self) -> bool:
+        """Initialize the CLOB client. Call once at startup."""
+        try:
+            from py_clob_client.client import ClobClient
+
+            if PAPER_MODE or not POLYMARKET_PRIVATE_KEY:
+                self._client = ClobClient(CLOB_HOST)
+                self._authenticated = False
+                logger.info("CLOB client initialized (read-only / paper mode)")
+            else:
+                self._client = ClobClient(
+                    host=CLOB_HOST,
+                    chain_id=CHAIN_ID,
+                    key=POLYMARKET_PRIVATE_KEY,
+                    signature_type=SIGNATURE_TYPE,
+                    funder=POLYMARKET_FUNDER_ADDRESS,
+                )
+                self._client.set_api_creds(self._client.create_or_derive_api_creds())
+                self._authenticated = True
+                logger.info("CLOB client initialized (authenticated)")
+
+            self._initialized = True
+            return True
+
+        except Exception as e:
+            logger.error(f"CLOB initialization failed: {e}")
             return False
-        _order_times.append(now)
-        return True
 
+    def is_ready(self) -> bool:
+        return self._initialized and self._client is not None
 
-# ── Result types ─────────────────────────────────
-@dataclass
-class PriceData:
-    token_id: str
-    buy_price: float
-    sell_price: float
-    midpoint: float
-    spread: float
-    timestamp: float
+    def is_authenticated(self) -> bool:
+        return self._authenticated
 
+    async def _get_session(self) -> aiohttp.ClientSession:
+        """Get or create a reusable HTTP session for Gamma API calls."""
+        if self._http_session is None or self._http_session.closed:
+            self._http_session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=15)
+            )
+        return self._http_session
 
-@dataclass
-class OrderResult:
-    success: bool
-    order_id: str = ""
-    error: str = ""
+    async def close(self):
+        """Close the HTTP session. Call on shutdown."""
+        if self._http_session and not self._http_session.closed:
+            await self._http_session.close()
 
+    # ─── PRICE QUERIES ───────────────────────────────────────────────────
 
-# ── CLOB Client Singleton ────────────────────────
-_read_client: Optional[ClobClient] = None
-_auth_client: Optional[ClobClient] = None
-
-
-def _get_reader() -> ClobClient:
-    """Read-only CLOB client (no auth needed)."""
-    global _read_client
-    if _read_client is None:
-        _read_client = ClobClient(config.CLOB_HOST)
-    return _read_client
-
-
-def _get_auth_client() -> Optional[ClobClient]:
-    """Authenticated CLOB client for order placement."""
-    global _auth_client
-    if _auth_client is not None:
-        return _auth_client
-    if not config.PRIVATE_KEY:
-        return None
-    try:
-        client = ClobClient(
-            host=config.CLOB_HOST,
-            chain_id=config.CHAIN_ID,
-            key=config.PRIVATE_KEY,
-            signature_type=config.SIGNATURE_TYPE,
-            funder=config.FUNDER_ADDRESS or None,
-        )
-        creds = client.create_or_derive_api_creds()
-        client.set_api_creds(creds)
-        # Verify
-        if client.get_ok():
-            _auth_client = client
-            logger.info("CLOB authenticated (Level 2)")
-            return client
-        else:
-            logger.error("CLOB auth health check failed")
+    def get_price(self, token_id: str, side: str = "BUY") -> Optional[float]:
+        """Get current price. CRITICAL: API returns dict, not float."""
+        try:
+            resp = self._client.get_price(token_id, side)
+            return float(resp["price"])
+        except Exception as e:
+            logger.error(f"get_price failed for {token_id[:20]}: {e}")
             return None
-    except Exception as e:
-        logger.error(f"CLOB auth failed: {e}")
-        return None
 
+    def get_midpoint(self, token_id: str) -> Optional[float]:
+        try:
+            resp = self._client.get_midpoint(token_id)
+            return float(resp["mid"])
+        except Exception as e:
+            logger.error(f"get_midpoint failed: {e}")
+            return None
 
-def is_authenticated() -> bool:
-    return _get_auth_client() is not None
+    def get_spread(self, token_id: str) -> Optional[float]:
+        try:
+            resp = self._client.get_spread(token_id)
+            return float(resp["spread"])
+        except Exception as e:
+            logger.error(f"get_spread failed: {e}")
+            return None
 
+    # ─── ORDER MANAGEMENT ────────────────────────────────────────────────
 
-# ══════════════════════════════════════════════════
-# READ-ONLY OPERATIONS (no auth)
-# ══════════════════════════════════════════════════
-
-def get_price(token_id: str) -> Optional[PriceData]:
-    """Get real orderbook price for a token. No auth needed."""
-    if not token_id:
-        return None
-    try:
-        reader = _get_reader()
-
-        buy_r = reader.get_price(token_id, "BUY")
-        buy = float(buy_r["price"]) if isinstance(buy_r, dict) else float(buy_r)
-
-        sell_r = reader.get_price(token_id, "SELL")
-        sell = float(sell_r["price"]) if isinstance(sell_r, dict) else float(sell_r)
-
-        mid_r = reader.get_midpoint(token_id)
-        mid = float(mid_r["mid"]) if isinstance(mid_r, dict) else float(mid_r)
-
-        spr_r = reader.get_spread(token_id)
-        spr = float(spr_r["spread"]) if isinstance(spr_r, dict) else float(spr_r)
-
-        return PriceData(
-            token_id=token_id,
-            buy_price=buy, sell_price=sell,
-            midpoint=mid, spread=spr,
-            timestamp=time.time(),
-        )
-    except Exception as e:
-        logger.error(f"Price query failed for {token_id[:16]}…: {e}")
-        return None
-
-
-def health_check() -> dict:
-    """Check CLOB connectivity and auth status."""
-    result = {"read": False, "auth": False, "error": ""}
-    try:
-        reader = _get_reader()
-        reader.get_ok()
-        result["read"] = True
-    except Exception as e:
-        result["error"] = f"Read: {e}"
-    result["auth"] = is_authenticated()
-    return result
-
-
-# ══════════════════════════════════════════════════
-# ORDER OPERATIONS (requires auth)
-# ══════════════════════════════════════════════════
-
-def place_limit_buy(token_id: str, price: float, size: float) -> OrderResult:
-    """
-    Place a MAKER limit BUY order.
-    post_only=True ensures we never accidentally take liquidity.
-    
-    Returns OrderResult with order_id on success.
-    """
-    client = _get_auth_client()
-    if not client:
-        return OrderResult(success=False, error="Not authenticated")
-
-    if not _rate_ok():
-        return OrderResult(success=False, error="Rate limited")
-
-    if price < 0.01 or price > 0.99:
-        return OrderResult(success=False, error=f"Bad price: {price}")
-    if size < config.MIN_SHARES:
-        return OrderResult(success=False, error=f"Size {size} < min {config.MIN_SHARES}")
-
-    try:
-        tick_size = client.get_tick_size(token_id)
-        options = PartialCreateOrderOptions(tick_size=tick_size)
-
-        order_args = OrderArgs(
-            token_id=token_id,
-            price=price,
-            size=size,
-            side=BUY,
-        )
-
-        signed = client.create_order(order_args, options)
-        resp = client.post_order(signed, OrderType.GTC, post_only=True)
-
-        if isinstance(resp, dict):
-            oid = resp.get("orderID", resp.get("id", ""))
-            err = resp.get("error", "")
-            if err:
-                return OrderResult(success=False, error=err)
-            if oid:
-                logger.info(f"LIMIT BUY posted: {size}× @ ${price:.4f} → {oid[:16]}")
-                return OrderResult(success=True, order_id=oid)
-            return OrderResult(success=False, error="No order ID in response")
-        else:
-            return OrderResult(success=True, order_id=str(resp))
-
-    except Exception as e:
-        logger.error(f"Order error: {e}")
-        return OrderResult(success=False, error=str(e)[:200])
-
-
-def cancel_order(order_id: str) -> bool:
-    """Cancel an open order. Returns True on success."""
-    client = _get_auth_client()
-    if not client:
-        return False
-    try:
-        client.cancel(order_id)
-        logger.info(f"Cancelled: {order_id[:16]}")
+    def _check_rate_limit(self) -> bool:
+        now = time.time()
+        self._order_timestamps = [t for t in self._order_timestamps if now - t < 60]
+        if len(self._order_timestamps) >= MAX_ORDERS_PER_MINUTE:
+            logger.warning(f"Rate limit: {len(self._order_timestamps)} orders in last 60s")
+            return False
         return True
-    except Exception as e:
-        logger.error(f"Cancel failed: {e}")
-        return False
+
+    def place_order(self, token_id: str, price: float, size: float, side: str = "BUY") -> Optional[dict]:
+        """
+        Place a maker limit order with post_only=True.
+        Uses create_order + post_order separately.
+        """
+        if not self._authenticated:
+            logger.info(f"[PAPER] Would place {side} {size:.1f}@{price:.3f} on {token_id[:16]}...")
+            return {"orderID": f"paper-{int(time.time()*1000)}", "paper": True}
+
+        if not self._check_rate_limit():
+            return None
+
+        try:
+            from py_clob_client.clob_types import OrderArgs, OrderType, PartialCreateOrderOptions
+            from py_clob_client.order_builder.constants import BUY, SELL
+
+            tick_size = self._client.get_tick_size(token_id)
+            options = PartialCreateOrderOptions(tick_size=tick_size)
+            order_side = BUY if side == "BUY" else SELL
+            order_args = OrderArgs(token_id=token_id, price=price, size=size, side=order_side)
+
+            signed = self._client.create_order(order_args, options)
+            result = self._client.post_order(signed, OrderType.GTC, post_only=True)
+
+            self._order_timestamps.append(time.time())
+            logger.info(f"Order placed: {side} {size}@{price} → {result.get('orderID', '?')}")
+            return result
+
+        except Exception as e:
+            logger.error(f"Order placement failed: {e}")
+            return None
+
+    def cancel_order(self, order_id: str) -> bool:
+        if not self._authenticated:
+            logger.info(f"[PAPER] Would cancel order {order_id}")
+            return True
+        try:
+            self._client.cancel(order_id)
+            logger.info(f"Cancelled order {order_id}")
+            return True
+        except Exception as e:
+            logger.error(f"Cancel failed for {order_id}: {e}")
+            return False
+
+    def get_open_orders(self) -> list[dict]:
+        """Poll open orders (fill notifications can be lost on connection drops)."""
+        if not self._authenticated:
+            return []
+        try:
+            orders = self._client.get_orders()
+            return orders if isinstance(orders, list) else []
+        except Exception as e:
+            logger.error(f"get_orders failed: {e}")
+            return []
+
+    # ─── BALANCE ─────────────────────────────────────────────────────────
+
+    def get_balance(self) -> Optional[float]:
+        """Read USDC balance. NEVER calls update_balance_allowance()."""
+        if not self._authenticated:
+            return None
+        try:
+            bal = self._client.get_balance_allowance()
+            return float(bal.get("balance", 0)) if isinstance(bal, dict) else None
+        except Exception as e:
+            logger.error(f"get_balance failed: {e}")
+            return None
+
+    # ─── MARKET DISCOVERY ────────────────────────────────────────────────
+
+    async def fetch_polymarket_events(self, sport: str) -> list[dict]:
+        """Fetch active Polymarket events for a sport. Filters out futures/props."""
+        tag = SPORT_TAG_SLUGS.get(sport)
+        if not tag:
+            return []
+
+        url = f"{GAMMA_API}/events"
+        params = {"active": "true", "tag_slug": tag, "limit": 50}
+
+        try:
+            session = await self._get_session()
+            async with session.get(url, params=params) as resp:
+                if resp.status != 200:
+                    logger.warning(f"Gamma API {sport} returned {resp.status}")
+                    return []
+                data = await resp.json()
+        except Exception as e:
+            logger.error(f"Gamma API fetch failed for {sport}: {e}")
+            return []
+
+        events = []
+        for event in data if isinstance(data, list) else []:
+            try:
+                title = event.get("title", "").lower()
+                if any(word in title for word in FUTURES_BLOCK):
+                    continue
+                events.append(event)
+            except Exception:
+                continue
+
+        return events
+
+    async def check_resolution(self, condition_id: str) -> Optional[dict]:
+        """Check if a market has resolved via Gamma API."""
+        url = f"{GAMMA_API}/markets"
+        params = {"conditionId": condition_id}
+
+        try:
+            session = await self._get_session()
+            async with session.get(url, params=params) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+        except Exception as e:
+            logger.error(f"Resolution check failed for {condition_id}: {e}")
+            return None
+
+        market = None
+        if isinstance(data, list) and len(data) > 0:
+            market = data[0]
+        elif isinstance(data, dict):
+            market = data
+
+        if not market:
+            return None
+
+        if not (market.get("closed", False) or market.get("resolved", False)):
+            return {"resolved": False}
+
+        try:
+            prices_str = market.get("outcomePrices", "[]")
+            prices = json.loads(prices_str) if isinstance(prices_str, str) else prices_str
+            yes_price = float(prices[0]) if len(prices) > 0 else 0.0
+            no_price = float(prices[1]) if len(prices) > 1 else 0.0
+        except Exception:
+            yes_price = 0.0
+            no_price = 0.0
+
+        winner = "UNKNOWN"
+        if yes_price >= 0.99:
+            winner = "YES"
+        elif yes_price <= 0.01:
+            winner = "NO"
+
+        return {"resolved": True, "winner": winner, "yes_price": yes_price, "no_price": no_price}
 
 
-def cancel_all_orders() -> bool:
-    """Cancel all open orders."""
-    client = _get_auth_client()
-    if not client:
-        return False
+def parse_market_tokens(market: dict) -> Optional[dict]:
+    """
+    Parse a Gamma API market dict to extract token IDs, outcomes, and prices.
+    Returns dict with condition_id, question, outcomes, token_ids, prices, end_date
+    or None if parsing fails.
+    """
     try:
-        client.cancel_all()
-        logger.info("Cancelled all open orders")
-        return True
+        markets = market.get("markets", [])
+        if not markets:
+            return None
+
+        m = markets[0]
+        condition_id = m.get("conditionId", "")
+        question = m.get("question", market.get("title", ""))
+
+        outcomes_str = m.get("outcomes", "[]")
+        outcomes = json.loads(outcomes_str) if isinstance(outcomes_str, str) else outcomes_str
+
+        tokens_str = m.get("clobTokenIds", "[]")
+        tokens = json.loads(tokens_str) if isinstance(tokens_str, str) else tokens_str
+
+        prices_str = m.get("outcomePrices", "[]")
+        prices = json.loads(prices_str) if isinstance(prices_str, str) else prices_str
+        prices = [float(p) for p in prices]
+
+        if len(outcomes) < 2 or len(tokens) < 2:
+            return None
+
+        if m.get("closed", False):
+            return None
+
+        return {
+            "condition_id": condition_id,
+            "question": question,
+            "outcomes": outcomes,
+            "token_ids": tokens,
+            "prices": prices,
+            "end_date": m.get("endDate", market.get("endDate", "")),
+        }
+
     except Exception as e:
-        logger.error(f"Cancel all failed: {e}")
-        return False
-
-
-def check_order_filled(order_id: str) -> Optional[dict]:
-    """
-    Check if an order has been filled.
-    Returns {'filled': bool, 'size_matched': float, 'price': float} or None.
-    
-    IMPORTANT: Fill notifications can be lost on connection drops.
-    Always poll this rather than relying on events.
-    """
-    client = _get_auth_client()
-    if not client:
+        logger.error(f"Failed to parse market tokens: {e}")
         return None
-    try:
-        orders = client.get_orders(OpenOrderParams(id=order_id))
-        if isinstance(orders, list) and len(orders) > 0:
-            o = orders[0]
-            matched = float(o.get("size_matched", 0))
-            original = float(o.get("original_size", 0))
-            return {
-                "filled": matched >= original * 0.95 if original > 0 else False,
-                "size_matched": matched,
-                "price": float(o.get("price", 0)),
-                "status": o.get("status", "unknown"),
-            }
-        elif isinstance(orders, list) and len(orders) == 0:
-            # Order not in open orders — might be filled or expired
-            # Wait 500ms per research before checking trades
-            time.sleep(config.POST_FILL_DELAY)
-            return {"filled": True, "size_matched": 0, "price": 0, "status": "gone"}
-        return None
-    except Exception as e:
-        logger.error(f"Fill check error: {e}")
-        return None
-
-
-def get_balance() -> dict:
-    """
-    Get USDC balance. NEVER call update_balance_allowance() — it overwrites state.
-    """
-    client = _get_auth_client()
-    if not client:
-        return {"balance": 0, "allowance": 0}
-    try:
-        r = client.get_balance_allowance(
-            BalanceAllowanceParams(signature_type=config.SIGNATURE_TYPE)
-        )
-        if isinstance(r, dict):
-            return {
-                "balance": float(r.get("balance", 0)),
-                "allowance": float(r.get("allowance", 0)),
-            }
-        return {"balance": 0, "allowance": 0}
-    except Exception as e:
-        logger.error(f"Balance error: {e}")
-        return {"balance": 0, "allowance": 0}

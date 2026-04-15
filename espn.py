@@ -1,19 +1,32 @@
 """
 espn.py — ESPN Live Score Verification Engine
+Battle-tested blowout detection across 17 sports/leagues.
+Fetches live scores from ESPN's free API, computes game elapsed %,
+and determines blowout confidence levels.
 
-Free API. No key needed. Real-time scores across 10 sports.
-Calculates verified win probability from lead + game progress.
+Exports:
+    VerifiedGame  — dataclass with all game state
+    fetch_verified_games() → list[VerifiedGame] (sorted by confidence desc)
+    fetch_all_live_games() → list[dict] (all in-progress games for dashboard)
+    team_search_terms(full_name, abbrev) → list[str] for Polymarket matching
 """
 
-import re
-import requests
+import asyncio
+import logging
 from dataclasses import dataclass
 from typing import Optional
-import config
+import aiohttp
+
+from config import ESPN_SPORTS, WIN_THRESHOLDS, SOCCER_SPORTS
+
+logger = logging.getLogger("espn")
+
+ESPN_BASE = "https://site.api.espn.com/apis/site/v2/sports"
 
 
 @dataclass
 class VerifiedGame:
+    """Complete state of a verified in-progress game."""
     espn_id: str
     sport: str
     home_team: str
@@ -23,203 +36,263 @@ class VerifiedGame:
     home_score: int
     away_score: int
     leader: str
-    leader_team: str
-    trailer_team: str
+    leader_abbrev: str
+    trailer: str
+    trailer_abbrev: str
     lead: int
-    period: str
+    period: int
     clock: str
     elapsed_pct: float
-    detail: str
     confidence: float
     level: str
     score_line: str
 
 
-def fetch_verified_games() -> list[VerifiedGame]:
-    verified = []
-    for sport_key, sport_cfg in config.ESPN_SPORTS.items():
+def team_search_terms(full_name: str, abbrev: str) -> list[str]:
+    """
+    Generate search terms for matching a team to Polymarket markets.
+    Returns multiple variants to increase match probability.
+    """
+    terms = []
+    full_lower = full_name.lower().strip()
+    abbrev_lower = abbrev.lower().strip()
+
+    terms.append(full_lower)
+
+    parts = full_lower.split()
+    if len(parts) > 1:
+        terms.append(parts[-1])
+
+    terms.append(abbrev_lower)
+
+    if len(parts) == 3:
+        initials = parts[0][0] + parts[1][0]
+        terms.append(f"{initials} {parts[-1]}")
+
+    city_abbrevs = {
+        "new york": "ny", "new jersey": "nj", "los angeles": "la",
+        "san francisco": "sf", "san antonio": "sa", "san diego": "sd",
+        "golden state": "gs", "oklahoma city": "okc", "tampa bay": "tb",
+        "green bay": "gb", "kansas city": "kc", "new orleans": "no",
+        "new england": "ne", "st louis": "stl", "st. louis": "stl",
+        "inter miami": "inter", "real madrid": "real",
+        "manchester city": "man city", "manchester united": "man utd",
+    }
+    for city, short in city_abbrevs.items():
+        if full_lower.startswith(city):
+            mascot = full_lower.replace(city, "").strip()
+            if mascot:
+                terms.append(f"{short} {mascot}")
+            else:
+                terms.append(short)
+            break
+
+    return list(dict.fromkeys(terms))
+
+
+def _get_threshold_key(sport: str) -> str:
+    """Map sport key to WIN_THRESHOLDS key. All soccer leagues share 'soccer'."""
+    if sport in SOCCER_SPORTS:
+        return "soccer"
+    return sport
+
+
+def _compute_elapsed_pct(sport: str, period: int, clock: str, status_detail: str) -> float:
+    """Compute what fraction of the game has elapsed."""
+    sport_cfg = ESPN_SPORTS.get(sport, {})
+    total_periods = sport_cfg.get("periods", 4)
+
+    detail_lower = status_detail.lower() if status_detail else ""
+    if "final" in detail_lower or "end" in detail_lower:
+        return 1.0
+    if "halftime" in detail_lower:
+        return 0.5
+
+    clock_seconds = 0
+    if clock and ":" in clock:
         try:
-            r = requests.get(sport_cfg["url"], timeout=12)
-            if not r.ok:
-                continue
-            for event in r.json().get("events", []):
-                game = _parse_game(event, sport_key)
-                if game and game.confidence >= 0.975:
-                    verified.append(game)
-        except Exception:
-            continue
-    verified.sort(key=lambda g: g.confidence, reverse=True)
-    return verified
+            parts = clock.split(":")
+            clock_seconds = int(parts[0]) * 60 + int(parts[1])
+        except (ValueError, IndexError):
+            clock_seconds = 0
 
+    period_lengths = {
+        "nba": 720, "wnba": 600, "nhl": 1200, "nfl": 900,
+        "ncaab": 1200, "ncaaf": 900,
+        "mlb": 1,
+    }
 
-def _parse_game(event: dict, sport: str) -> Optional[VerifiedGame]:
-    status = event.get("status", {}).get("type", {})
-    state = status.get("state", "")
-    if state not in ("in", "post"):
-        return None
+    is_soccer = sport in SOCCER_SPORTS
 
-    detail = status.get("detail", "")
-    clock = status.get("displayClock", "")
-    comp = (event.get("competitions") or [{}])[0]
-    competitors = comp.get("competitors", [])
-    if len(competitors) < 2:
-        return None
+    if sport == "mlb":
+        return min(max((period - 0.5) / total_periods, 0.0), 1.0)
 
-    home = away = None
-    for c in competitors:
-        if c.get("homeAway") == "home":
-            home = c
+    if is_soccer:
+        # Soccer counts UP. Clock shows elapsed minutes.
+        # Each half = 45 min = 2700 seconds. Total = 5400s.
+        half_duration = 2700
+        if period == 1:
+            return min(clock_seconds / (half_duration * 2), 0.5)
         else:
-            away = c
-    if not home or not away:
-        return None
+            return min(0.5 + clock_seconds / (half_duration * 2), 1.0)
 
-    home_team = home.get("team", {}).get("displayName", "Unknown")
-    away_team = away.get("team", {}).get("displayName", "Unknown")
-    home_abbrev = home.get("team", {}).get("abbreviation", "???")
-    away_abbrev = away.get("team", {}).get("abbreviation", "???")
+    # Count-down sports (NBA, NFL, NHL, NCAA)
+    period_len = period_lengths.get(sport, 720)
+    completed_time = (period - 1) * period_len
+    elapsed_in_period = period_len - clock_seconds
+    total_game_time = total_periods * period_len
+
+    elapsed = completed_time + max(elapsed_in_period, 0)
+    return min(max(elapsed / total_game_time, 0.0), 1.0)
+
+
+def _evaluate_blowout(sport: str, lead: int, elapsed_pct: float) -> tuple[float, str]:
+    """Check if game qualifies as a blowout. Returns (confidence, level)."""
+    key = _get_threshold_key(sport)
+    thresholds = WIN_THRESHOLDS.get(key, [])
+    for min_lead, min_elapsed, conf, level in thresholds:
+        if lead >= min_lead and elapsed_pct >= min_elapsed:
+            return conf, level
+    return 0.0, ""
+
+
+async def _fetch_sport_games(session: aiohttp.ClientSession, sport: str) -> tuple[list[VerifiedGame], list[dict]]:
+    """
+    Fetch all live games for a single sport from ESPN.
+    Returns (verified_blowouts, all_live_games_for_dashboard).
+    """
+    cfg = ESPN_SPORTS.get(sport)
+    if not cfg:
+        return [], []
+
+    url = f"{ESPN_BASE}/{cfg['slug']}/{cfg['league']}/scoreboard"
+    blowouts = []
+    live_games = []
 
     try:
-        home_score = int(home.get("score", "0"))
-        away_score = int(away.get("score", "0"))
-    except (ValueError, TypeError):
-        return None
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            if resp.status != 200:
+                logger.warning(f"ESPN {sport} returned status {resp.status}")
+                return [], []
+            data = await resp.json()
+    except Exception as e:
+        logger.error(f"ESPN fetch failed for {sport}: {e}")
+        return [], []
 
-    lead = abs(home_score - away_score)
-    if lead == 0:
-        return None
+    events = data.get("events", [])
+    for event in events:
+        try:
+            competition = event["competitions"][0]
+            status = competition.get("status", {})
+            status_type = status.get("type", {})
 
-    if home_score > away_score:
-        leader, leader_team, trailer_team = "home", home_team, away_team
-    else:
-        leader, leader_team, trailer_team = "away", away_team, home_team
+            if status_type.get("state") != "in":
+                continue
 
-    elapsed_pct = _calc_elapsed(sport, detail, state)
-    confidence, level = _check_thresholds(sport, lead, elapsed_pct, state)
+            competitors = competition.get("competitors", [])
+            if len(competitors) < 2:
+                continue
 
-    if confidence < 0.975:
-        return None
+            home = away = None
+            for comp in competitors:
+                if comp.get("homeAway") == "home":
+                    home = comp
+                else:
+                    away = comp
 
-    period = _extract_period(detail, sport)
-    score_line = f"{home_abbrev} {home_score} - {away_abbrev} {away_score} {period} {clock}".strip()
+            if not home or not away:
+                continue
 
-    return VerifiedGame(
-        espn_id=str(event.get("id", "")), sport=sport,
-        home_team=home_team, away_team=away_team,
-        home_abbrev=home_abbrev, away_abbrev=away_abbrev,
-        home_score=home_score, away_score=away_score,
-        leader=leader, leader_team=leader_team, trailer_team=trailer_team,
-        lead=lead, period=period, clock=clock,
-        elapsed_pct=elapsed_pct, detail=detail,
-        confidence=confidence, level=level, score_line=score_line,
-    )
+            home_team = home.get("team", {}).get("displayName", "Unknown")
+            away_team = away.get("team", {}).get("displayName", "Unknown")
+            home_abbrev = home.get("team", {}).get("abbreviation", "???")
+            away_abbrev = away.get("team", {}).get("abbreviation", "???")
+            home_score = int(home.get("score", 0))
+            away_score = int(away.get("score", 0))
+            period = int(status.get("period", 1))
+            clock = status.get("displayClock", "0:00")
+            status_detail = status_type.get("detail", "")
 
+            # Add to dashboard live games regardless of blowout status
+            live_games.append({
+                "espn_id": event.get("id", ""),
+                "sport": sport,
+                "home": f"{home_abbrev} {home_score}",
+                "away": f"{away_abbrev} {away_score}",
+                "detail": status_detail or f"P{period} {clock}",
+            })
 
-def _calc_elapsed(sport: str, detail: str, state: str) -> float:
-    if state == "post":
-        return 1.0
-    d = detail.lower()
-    clock_mins = _parse_clock(detail)
+            lead = abs(home_score - away_score)
+            if lead == 0:
+                continue
 
-    if sport in ("nba", "nfl", "ncaaf"):
-        qtr_len = 12.0 if sport == "nba" else 15.0
-        for qi, label in enumerate(["1st", "2nd", "3rd", "4th"]):
-            if label in d:
-                base = qi / 4.0
-                if clock_mins is not None:
-                    return base + ((qtr_len - clock_mins) / qtr_len) / 4.0
-                return base + 0.125
-        if "ot" in d or "overtime" in d:
-            return 0.96
-        if "half" in d:
-            return 0.50
+            if home_score > away_score:
+                leader, leader_abbrev = home_team, home_abbrev
+                trailer, trailer_abbrev = away_team, away_abbrev
+            else:
+                leader, leader_abbrev = away_team, away_abbrev
+                trailer, trailer_abbrev = home_team, home_abbrev
 
-    elif sport in ("ncaab", "wnba"):
-        for hi, label in enumerate(["1st", "2nd"]):
-            if label in d:
-                base = hi * 0.5
-                if clock_mins is not None:
-                    return base + ((20.0 - clock_mins) / 20.0) * 0.5
-                return base + 0.25
-        if "ot" in d:
-            return 0.96
+            elapsed_pct = _compute_elapsed_pct(sport, period, clock, status_detail)
+            confidence, level = _evaluate_blowout(sport, lead, elapsed_pct)
 
-    elif sport == "nhl":
-        for pi, label in enumerate(["1st", "2nd", "3rd"]):
-            if label in d:
-                base = pi / 3.0
-                if clock_mins is not None:
-                    return base + ((20.0 - clock_mins) / 20.0) / 3.0
-                return base + 0.167
-        if "ot" in d:
-            return 0.96
+            if confidence == 0.0:
+                continue
 
-    elif sport == "mlb":
-        m = re.search(r'(\w+)\s+(\d+)(st|nd|rd|th)', d)
-        if m:
-            half = 0 if m.group(1) in ("top", "mid") else 1
-            inning = int(m.group(2))
-            return min(((inning - 1) * 2 + half) / 18.0, 1.0)
-        m2 = re.search(r'(\d+)(st|nd|rd|th)', d)
-        if m2:
-            return min((int(m2.group(1)) - 1) / 9.0, 1.0)
+            period_name = cfg.get("period_name", "P")
+            score_line = (
+                f"{leader_abbrev} {max(home_score, away_score)}-{min(home_score, away_score)} "
+                f"{trailer_abbrev} | {period_name}{period} {clock} | {level} ({confidence:.1%})"
+            )
 
-    elif sport in ("epl", "mls", "liga"):
-        m = re.search(r"(\d+)'", detail)
-        if m:
-            return min(int(m.group(1)) / 90.0, 1.0)
-        if "half" in d:
-            return 0.50
+            blowouts.append(VerifiedGame(
+                espn_id=event.get("id", ""),
+                sport=sport,
+                home_team=home_team,
+                away_team=away_team,
+                home_abbrev=home_abbrev,
+                away_abbrev=away_abbrev,
+                home_score=home_score,
+                away_score=away_score,
+                leader=leader,
+                leader_abbrev=leader_abbrev,
+                trailer=trailer,
+                trailer_abbrev=trailer_abbrev,
+                lead=lead,
+                period=period,
+                clock=clock,
+                elapsed_pct=elapsed_pct,
+                confidence=confidence,
+                level=level,
+                score_line=score_line,
+            ))
 
-    return 0.5
+        except Exception as e:
+            logger.error(f"Error parsing ESPN event in {sport}: {e}")
+            continue
 
-
-def _check_thresholds(sport: str, lead: int, elapsed: float, state: str) -> tuple[float, str]:
-    if state == "post" and lead > 0:
-        return 1.0, "final"
-    lookup = "soccer" if sport in ("epl", "mls", "liga") else sport
-    for min_lead, min_elapsed, conf, level in config.WIN_THRESHOLDS.get(lookup, []):
-        if lead >= min_lead and elapsed >= min_elapsed:
-            return conf, level
-    return 0.50, "none"
-
-
-def _extract_period(detail: str, sport: str) -> str:
-    d = detail.lower()
-    if sport in ("nba", "nfl", "ncaaf"):
-        for q in ["4th", "3rd", "2nd", "1st"]:
-            if q in d:
-                return q
-    elif sport in ("ncaab", "wnba"):
-        if "2nd" in d: return "2H"
-        if "1st" in d: return "1H"
-    elif sport == "nhl":
-        for p in ["3rd", "2nd", "1st"]:
-            if p in d: return p
-    elif sport == "mlb":
-        m = re.search(r'(\w+)\s+(\d+)(st|nd|rd|th)', d)
-        if m: return f"{m.group(1).capitalize()} {m.group(2)}{m.group(3)}"
-    elif sport in ("epl", "mls", "liga"):
-        m = re.search(r"(\d+)'", detail)
-        if m: return f"{m.group(1)}'"
-    if "ot" in d: return "OT"
-    if "final" in d: return "Final"
-    if "half" in d: return "Half"
-    return detail[:20]
+    return blowouts, live_games
 
 
-def _parse_clock(detail: str) -> Optional[float]:
-    m = re.search(r'(\d{1,2}):(\d{2})', detail)
-    return int(m.group(1)) + int(m.group(2)) / 60.0 if m else None
+async def fetch_verified_games() -> tuple[list[VerifiedGame], list[dict]]:
+    """
+    Fetch all live blowout games across all configured sports.
+    Returns (blowouts sorted by confidence desc, all live games for dashboard).
+    """
+    async with aiohttp.ClientSession() as session:
+        tasks = [_fetch_sport_games(session, sport) for sport in ESPN_SPORTS]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
+    all_blowouts = []
+    all_live = []
+    for result in results:
+        if isinstance(result, Exception):
+            logger.error(f"Sport fetch exception: {result}")
+            continue
+        blowouts, live = result
+        all_blowouts.extend(blowouts)
+        all_live.extend(live)
 
-def team_search_terms(full_name: str, abbrev: str) -> list[str]:
-    terms = set()
-    fl = full_name.lower().strip()
-    terms.add(fl)
-    parts = fl.split()
-    if parts:
-        terms.add(parts[-1])
-    if abbrev:
-        terms.add(abbrev.lower())
-    return [t for t in terms if len(t) > 2]
+    all_blowouts.sort(key=lambda g: g.confidence, reverse=True)
+    logger.info(f"ESPN scan: {len(all_blowouts)} blowouts, {len(all_live)} live games across {len(ESPN_SPORTS)} sports")
+    return all_blowouts, all_live

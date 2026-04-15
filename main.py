@@ -1,289 +1,251 @@
 """
-main.py — Signal Harvest Bot v3
-
-Single-engine sports blowout harvester.
-Scan → Execute → Track → Resolve → Repeat.
-
-Paper mode: simulates execution, tracks virtual bankroll.
-Live mode: places maker limit orders on Polymarket CLOB.
+main.py — Signal Harvest Bot Orchestrator
+Single-threaded main loop running both engines with API server.
+Scan → Execute → Resolve cycle.
 """
 
-import time
+import asyncio
+import logging
 import sys
-import os
-from datetime import datetime, timezone
-from dataclasses import asdict
+import time
+import uuid
 
-import config
-from scanner import scan, HarvestSignal
-from positions import PositionManager
-from clob import (
-    is_authenticated, place_limit_buy, cancel_order,
-    check_order_filled, get_balance, health_check,
+from aiohttp import web
+
+from config import (
+    PAPER_MODE, API_PORT, STARTING_BANKROLL,
+    HARVEST_INTERVAL, SHARP_INTERVAL, RESOLVE_INTERVAL,
+    MAX_UNFILLED_AGE, FILL_CHECK_DELAY_MS,
 )
-from api import start as start_api, update_state, add_log
+from clob import ClobInterface
+from positions import PositionManager, Position
+from harvest import scan_harvest
+from sharp import scan_sharp
+from odds import reset_daily_calls
+from api import create_api
 
-# ── State ──
-positions = PositionManager()
-bankroll = config.STARTING_BANKROLL  # Paper bankroll (live uses CLOB balance)
-scan_count = 0
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(name)-10s] %(levelname)-5s %(message)s",
+    datefmt="%H:%M:%S",
+    stream=sys.stdout,
+)
+logger = logging.getLogger("main")
 
 
-def log(msg: str):
-    ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
-    print(f"  [{ts}] {msg}")
-    add_log(msg)
+async def execute_signal(signal, clob: ClobInterface, positions: PositionManager):
+    """Execute a trade signal. Places maker limit order and records position."""
+    if signal.clob_price <= 0:
+        return
+    shares = round(signal.kelly_size / signal.clob_price, 2)
+    if shares < 1:
+        return
 
-
-def push_dashboard():
-    """Push current state to dashboard API."""
-    stats = positions.get_stats(bankroll)
-    open_pos = positions.get_open()
-    update_state(
-        **stats,
-        open_positions=[asdict(p) for p in open_pos],
-        scan_count=scan_count,
-        last_scan=datetime.now(timezone.utc).isoformat(),
+    result = clob.place_order(
+        token_id=signal.token_id,
+        price=signal.clob_price,
+        size=shares,
+        side="BUY",
     )
 
+    if result is None:
+        logger.warning(f"Order failed for {signal.team}")
+        return
 
-# ══════════════════════════════════════════════════
-# MAIN ENGINE LOOP
-# ══════════════════════════════════════════════════
+    order_id = result.get("orderID", f"unknown-{int(time.time())}")
 
-def engine_loop():
-    global bankroll, scan_count
+    position = Position(
+        id=str(uuid.uuid4())[:12],
+        engine=signal.engine,
+        sport=signal.sport,
+        market_question=signal.market_question,
+        condition_id=signal.condition_id,
+        team=signal.team,
+        side=signal.side,
+        token_id=signal.token_id,
+        entry_price=signal.clob_price,
+        size=shares,
+        cost=round(signal.clob_price * shares, 2),
+        confidence=signal.confidence,
+        order_id=order_id,
+        status="filled" if PAPER_MODE else "open",
+        score_line=getattr(signal, "score_line", ""),
+        pinnacle_prob=getattr(signal, "pinnacle_prob", 0.0),
+        edge=signal.edge,
+    )
 
-    # ── Restore bankroll from persisted state ──
-    # bankroll = starting - sum(open costs) + sum(resolved payouts)
-    open_cost = sum(p.cost_basis for p in positions.get_open())
-    bankroll = config.STARTING_BANKROLL - open_cost + positions.total_pnl
-    if positions.total_trades > 0:
-        log(f"Restored bankroll: ${bankroll:.2f} ({positions.total_trades} trades, ${positions.total_pnl:+.2f} P&L)")
+    if PAPER_MODE:
+        position.fill_price = signal.clob_price
+        position.filled_at = time.time()
+
+    await positions.open_position(position)
+    logger.info(f"✅ Executed: {signal.engine} | {signal.team} {signal.side}@{signal.clob_price} x{shares}")
+
+
+async def check_fills(clob: ClobInterface, positions: PositionManager):
+    """Poll open orders to detect fills (notifications can be lost)."""
+    if PAPER_MODE:
+        return
+
+    open_orders = clob.get_open_orders()
+    if not open_orders:
+        return
+
+    filled_ids = set()
+    for order in open_orders:
+        status = order.get("status", "").lower()
+        if status in ("filled", "matched"):
+            filled_ids.add(order.get("id", ""))
+
+    for pos in positions.get_open_positions():
+        if pos.status == "open" and pos.order_id in filled_ids:
+            await asyncio.sleep(FILL_CHECK_DELAY_MS / 1000)
+            await positions.mark_filled(pos.id)
+
+
+async def cancel_stale_orders(clob: ClobInterface, positions: PositionManager):
+    """Cancel unfilled orders older than MAX_UNFILLED_AGE."""
+    stale = positions.get_stale_orders(MAX_UNFILLED_AGE)
+    for pos in stale:
+        logger.info(f"Cancelling stale order {pos.order_id} ({pos.team})")
+        clob.cancel_order(pos.order_id)
+        await positions.cancel_position(pos.id)
+
+
+async def check_resolutions(clob: ClobInterface, positions: PositionManager):
+    """Check if any filled positions have resolved."""
+    filled = [p for p in positions.get_open_positions() if p.status == "filled"]
+    for pos in filled:
+        result = await clob.check_resolution(pos.condition_id)
+        if result is None:
+            continue
+        if not result.get("resolved", False):
+            continue
+        winner = result.get("winner", "UNKNOWN")
+        await positions.resolve_position(pos.id, winner)
+
+
+async def bot_loop(clob: ClobInterface, positions: PositionManager, bot_state: dict):
+    """Main bot loop with independent timers for each engine."""
+    last_harvest = 0.0
+    last_sharp = 0.0
+    last_resolve = 0.0
+    last_daily_reset = time.time()
+    harvest_scans = 0
+    sharp_scans = 0
+
+    mode_label = "📝 PAPER" if PAPER_MODE else "💰 LIVE"
+    logger.info(f"{'='*60}")
+    logger.info(f"  Signal Harvest Bot — {mode_label} MODE")
+    logger.info(f"  Starting bankroll: ${STARTING_BANKROLL:.2f}")
+    logger.info(f"  Equity: ${positions.equity:.2f}")
+    logger.info(f"  Open positions: {len(positions.get_open_positions())}")
+    logger.info(f"  Resolved trades: {len(positions.trades)}")
+    logger.info(f"{'='*60}")
 
     while True:
         try:
-            scan_count += 1
+            now = time.time()
 
-            # ── Phase 1: Resolve ──
-            resolved = positions.check_resolutions()
-            for pos in resolved:
-                if config.PAPER_MODE:
-                    bankroll += pos.shares * pos.exit_price
-                icon = "✓" if pos.pnl > 0 else "✗"
-                log(f"{icon} RESOLVED {pos.outcome} → ${pos.pnl:+.2f} ({pos.status})")
+            # Daily quota reset (midnight-ish)
+            if now - last_daily_reset > 86400:
+                reset_daily_calls()
+                last_daily_reset = now
+                logger.info("Daily Odds API call counter reset")
 
-                # Add resolved trade to dashboard history
-                existing = get_existing_trades()
-                # Update if already exists, otherwise prepend
-                updated = False
-                for i, t in enumerate(existing):
-                    if t.get("id") == pos.signal_id:
-                        existing[i]["status"] = pos.status
-                        existing[i]["pnl"] = pos.pnl
-                        existing[i]["exitPrice"] = pos.exit_price
-                        updated = True
-                        break
-                if not updated:
-                    existing.insert(0, {
-                        "id": pos.signal_id, "engine": "harvest", "sport": pos.sport,
-                        "event": pos.event, "outcome": pos.outcome,
-                        "entryPrice": pos.entry_price, "shares": pos.shares,
-                        "cost": pos.cost_basis, "confidence": pos.confidence,
-                        "level": pos.level, "scoreLine": pos.detail,
-                        "priceSource": pos.price_source, "spread": pos.spread_at_entry,
-                        "ev": pos.ev_at_entry, "status": pos.status,
-                        "pnl": pos.pnl, "exitPrice": pos.exit_price,
-                        "timestamp": pos.resolved_time or pos.entry_time,
-                    })
-                update_state(trade_history=existing[:300])
-                push_dashboard()
+            # ── HARVEST SCAN ─────────────────────────────────────
+            if now - last_harvest >= HARVEST_INTERVAL:
+                last_harvest = now
+                harvest_scans += 1
+                bot_state["last_harvest_scan"] = now
+                bot_state["scan_count"] = harvest_scans + sharp_scans
 
-            # ── Phase 2: Check fills on pending orders ──
-            if not config.PAPER_MODE:
-                for pos in positions.positions:
-                    if pos.status == "open" and pos.order_id:
-                        fill = check_order_filled(pos.order_id)
-                        if fill and fill.get("filled"):
-                            pos.status = "filled"
-                            log(f"FILL {pos.outcome} → {pos.shares}× @ ${pos.entry_price:.4f}")
-                            positions._save()
+                try:
+                    harvest_signals, live_games = await scan_harvest(clob, positions)
 
-                # Cancel stale unfilled orders
-                now = time.time()
-                for pos in positions.positions:
-                    if pos.status == "open" and pos.order_id and pos.entry_time:
-                        age = now - datetime.fromisoformat(pos.entry_time).timestamp()
-                        if age > config.ORDER_TIMEOUT:
-                            if cancel_order(pos.order_id):
-                                positions.cancel(pos)
-                                if config.PAPER_MODE:
-                                    bankroll += pos.cost_basis
-                                log(f"CANCELLED stale order: {pos.outcome} (age {age:.0f}s)")
+                    # Update dashboard live games
+                    bot_state["live_games"] = live_games
 
-            # ── Phase 3: Scan for new opportunities ──
-            equity = bankroll if config.PAPER_MODE else get_balance().get("balance", bankroll)
-            exposure = positions.get_exposure()
+                    for signal in harvest_signals:
+                        await execute_signal(signal, clob, positions)
 
-            result = scan(equity, exposure)
-            # scan() returns (signals, games) tuple
-            if isinstance(result, tuple):
-                signals, games = result
-            else:
-                signals, games = result, []
+                except Exception as e:
+                    logger.error(f"Harvest scan error: {e}", exc_info=True)
 
-            # Push games to dashboard
-            update_state(
-                verified_games=[{
-                    "sport": g.sport, "home": g.home_abbrev, "away": g.away_abbrev,
-                    "homeScore": g.home_score, "awayScore": g.away_score,
-                    "leader": g.leader_team, "lead": g.lead,
-                    "period": g.period, "clock": g.clock,
-                    "elapsed": g.elapsed_pct, "confidence": g.confidence,
-                    "level": g.level, "scoreLine": g.score_line,
-                } for g in (games if isinstance(games, list) else [])],
-                harvest_targets=[{
-                    "id": s.id, "sport": s.sport, "event": s.event_title,
-                    "outcome": s.outcome, "price": s.price, "shares": s.shares,
-                    "cost": s.cost, "return": s.implied_return,
-                    "confidence": s.confidence, "level": s.level,
-                    "scoreLine": s.score_line, "leader": s.leader_team,
-                    "priceSource": s.price_source, "spread": s.spread,
-                    "ev": s.ev_per_share,
-                } for s in signals],
-            )
+            # ── SHARP EDGE SCAN ──────────────────────────────────
+            if now - last_sharp >= SHARP_INTERVAL:
+                last_sharp = now
+                sharp_scans += 1
+                bot_state["last_sharp_scan"] = now
+                bot_state["scan_count"] = harvest_scans + sharp_scans
 
-            if signals:
-                log(f"{len(signals)} harvest signals found")
+                try:
+                    sharp_signals = await scan_sharp(clob, positions)
 
-            # ── Phase 4: Execute ──
-            for sig in signals[:8]:  # Max 8 trades per cycle
-                # Duplicate check
-                if positions.has_position(sig.condition_id):
-                    continue
+                    for signal in sharp_signals:
+                        await execute_signal(signal, clob, positions)
 
-                # ── LIVE EXECUTION ──
-                if not config.PAPER_MODE and is_authenticated():
-                    result = place_limit_buy(
-                        token_id=sig.token_id,
-                        price=sig.price,
-                        size=sig.shares,
-                    )
-                    if result.success:
-                        pos = positions.open(sig, order_id=result.order_id)
-                        src = "LIVE" if sig.price_source == "clob" else "GAMMA"
-                        log(
-                            f"ORDER {sig.shares}× {sig.outcome} @ ${sig.price:.4f} [{src}] "
-                            f"→ {result.order_id[:16]} │ EV:+{sig.ev_per_share*100:.1f}¢ │ {sig.score_line}"
-                        )
-                    else:
-                        log(f"ORDER FAILED: {result.error} │ {sig.outcome}")
+                except Exception as e:
+                    logger.error(f"Sharp scan error: {e}", exc_info=True)
 
-                # ── PAPER EXECUTION ──
-                else:
-                    if sig.cost <= bankroll:
-                        bankroll -= sig.cost
-                        pos = positions.open(sig)
-                        src = "LIVE" if sig.price_source == "clob" else "GAMMA"
-                        log(
-                            f"PAPER {sig.shares}× {sig.outcome} @ ${sig.price:.4f} [{src}] "
-                            f"→ {sig.implied_return:.1%} │ EV:+{sig.ev_per_share*100:.1f}¢ │ {sig.score_line}"
-                        )
+            # ── FILL CHECK + STALE CLEANUP ───────────────────────
+            try:
+                await check_fills(clob, positions)
+                await cancel_stale_orders(clob, positions)
+            except Exception as e:
+                logger.error(f"Fill check error: {e}", exc_info=True)
 
-                # Push after each trade
-                push_dashboard()
+            # ── RESOLUTION CHECK ─────────────────────────────────
+            if now - last_resolve >= RESOLVE_INTERVAL:
+                last_resolve = now
+                bot_state["last_resolve_check"] = now
 
-                # Add to dashboard trade history
-                update_state(trade_history=[{
-                    "id": sig.id, "engine": "harvest", "sport": sig.sport,
-                    "event": sig.event_title, "outcome": sig.outcome,
-                    "entryPrice": sig.price, "shares": sig.shares,
-                    "cost": sig.cost, "confidence": sig.confidence,
-                    "level": sig.level, "scoreLine": sig.score_line,
-                    "priceSource": sig.price_source, "spread": sig.spread,
-                    "ev": sig.ev_per_share, "status": "open", "pnl": None,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                }] + (get_existing_trades()))
+                try:
+                    await check_resolutions(clob, positions)
+                except Exception as e:
+                    logger.error(f"Resolution check error: {e}", exc_info=True)
 
-            push_dashboard()
-            time.sleep(config.SCAN_INTERVAL)
+            await asyncio.sleep(5)
 
+        except asyncio.CancelledError:
+            logger.info("Bot loop cancelled")
+            break
         except Exception as e:
-            log(f"ERROR: {e}")
-            import traceback
-            traceback.print_exc()
-            time.sleep(30)
+            logger.error(f"Main loop error: {e}", exc_info=True)
+            await asyncio.sleep(10)
 
 
-def get_existing_trades() -> list:
-    """Get existing trade history from dashboard state."""
-    from api import get_state
-    return get_state().get("trade_history", [])[:299]
+async def main():
+    bot_state = {
+        "started_at": time.time(),
+        "scan_count": 0,
+        "live_games": [],
+        "sharp_comparisons": [],
+    }
 
+    clob = ClobInterface()
+    if not clob.initialize():
+        logger.error("CLOB init failed — running degraded")
 
-# ══════════════════════════════════════════════════
-# STARTUP
-# ══════════════════════════════════════════════════
+    positions = PositionManager()
+    await positions.initialize()
 
-def main():
-    global bankroll
+    app = create_api(positions, bot_state)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", API_PORT)
+    await site.start()
+    logger.info(f"API server on port {API_PORT}")
 
-    print()
-    print("▓" * 56)
-    print("▓  SIGNAL HARVEST v3                                ▓")
-    print("▓  Sports Blowout Harvester · Maker Limit Orders    ▓")
-    print("▓" * 56)
-    print()
-
-    mode = "PAPER" if config.PAPER_MODE else "!! LIVE !!"
-    print(f"  Mode:       {mode}")
-    print(f"  Bankroll:   ${config.STARTING_BANKROLL:.2f}")
-    print(f"  Sports:     {len(config.ESPN_SPORTS)}")
-    print(f"  Price:      ${config.PRICE_MIN:.2f} – ${config.PRICE_MAX:.2f}")
-    print(f"  Max spread: {config.MAX_SPREAD:.0%}")
-    print(f"  Min EV:     ${config.MIN_EV:.3f}/share")
-    print(f"  Kelly:      {config.KELLY_FRACTION}× (max {config.KELLY_MAX_PCT:.0%})")
-    print(f"  Scan:       every {config.SCAN_INTERVAL}s")
-    print()
-
-    # Auth status
-    clob = health_check()
-    print(f"  CLOB read:  {'✓' if clob['read'] else '✗'}")
-    print(f"  CLOB auth:  {'✓' if clob['auth'] else '✗ (paper only)'}")
-    if not clob["auth"] and not config.PAPER_MODE:
-        print("  !! LIVE MODE but no CLOB auth — will not place orders")
-    print()
-    print("─" * 56)
-
-    # Load persisted state
-    stats = positions.get_stats(bankroll)
-    if stats["trades"] > 0:
-        print(f"  Restored: {stats['trades']} trades, ${stats['pnl']:+.2f} P&L")
-
-    # Start API
-    os.makedirs(os.path.dirname(config.STATE_FILE) or "data", exist_ok=True)
-    start_api()
-    push_dashboard()
-
-    if not config.PAPER_MODE:
-        print()
-        confirm = input("  LIVE MODE — type 'CONFIRM' to proceed: ")
-        if confirm.strip() != "CONFIRM":
-            print("  Aborted.")
-            sys.exit(0)
-
-    log(f"Engine started ({mode})")
-
-    # Single engine loop
     try:
-        engine_loop()
+        await bot_loop(clob, positions, bot_state)
     except KeyboardInterrupt:
-        stats = positions.get_stats(bankroll)
-        print(f"\n\n  ═══ SESSION END ═══")
-        print(f"  Equity:  ${stats['equity']:.2f}")
-        print(f"  P&L:    ${stats['pnl']:+.2f} ({stats['roi']:+.1f}%)")
-        print(f"  Trades: {stats['trades']} ({stats['win_rate']:.1%} win)")
+        logger.info("Keyboard interrupt")
+    finally:
+        await clob.close()
+        await runner.cleanup()
+        logger.info("Shutdown complete")
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
