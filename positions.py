@@ -84,7 +84,24 @@ class PositionManager:
                 self._redis_ok = True
             except Exception:
                 self._redis = None
-        await self._restore()
+
+        # Force reset: clears all state (set FORCE_RESET=true in Railway env vars)
+        if os.getenv("FORCE_RESET", "").lower() == "true":
+            logger.info("🔄 FORCE_RESET: clearing all state")
+            self.positions = {}
+            self.trades = []
+            try:
+                if self._redis_ok:
+                    await self._redis.delete("signal:state")
+                if os.path.exists(STATE_FILE):
+                    os.remove(STATE_FILE)
+            except Exception:
+                pass
+            await self._save()
+            logger.info("🔄 State reset complete — equity back to starting bankroll")
+        else:
+            await self._restore()
+
         logger.info(f"Positions: {len(self.positions)} open, {len(self.trades)} resolved, equity=${self.equity:.2f}")
 
     async def _save(self):
