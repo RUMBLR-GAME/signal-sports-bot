@@ -121,6 +121,7 @@ async def bot_loop(clob, positions, bot_state):
     while True:
         try:
             now = time.time()
+            log = bot_state.get("log_event", lambda *a,**k: None)
 
             # HARVEST — every 30s
             if now - last["harvest"] >= HARVEST_INTERVAL:
@@ -130,8 +131,11 @@ async def bot_loop(clob, positions, bot_state):
                 try:
                     signals, live_games = await scan_harvest(clob, positions)
                     bot_state["live_games"] = live_games
+                    if live_games:
+                        log(f"Monitoring {len(live_games)} live games", engine="harvest")
                     for s in signals:
                         await execute_signal(s, clob, positions)
+                        log(f"🎯 {s.game.leader} blowout — {s.score_line}", level="signal", engine="harvest")
                 except Exception as e:
                     logger.error(f"Harvest: {e}", exc_info=True)
 
@@ -140,8 +144,20 @@ async def bot_loop(clob, positions, bot_state):
                 last["edge_scan"] = now
                 bot_state["last_edge_scan"] = now
                 try:
-                    for s in await scan_edge(clob, positions):
+                    edge_signals = await scan_edge(clob, positions)
+                    # Store ALL edges found for scanner view (not just traded)
+                    if edge_signals:
+                        bot_state["edges_found"] = [{
+                            "team": s.team, "sport": s.sport, "poly": s.clob_price,
+                            "true": s.true_prob, "edge": s.edge, "provider": s.provider,
+                            "bet": s.bet_size, "t": now,
+                        } for s in edge_signals][:20]
+                        log(f"⚡ {len(edge_signals)} edges found", level="signal", engine="edge")
+                    else:
+                        log(f"Scanned odds — no edges above 5%", engine="edge")
+                    for s in edge_signals:
                         await execute_signal(s, clob, positions)
+                        log(f"⚡ BUY {s.team} @{s.clob_price:.2f} (true {s.true_prob:.2f}, edge {s.edge:.1%})", level="trade", engine="edge")
                 except Exception as e:
                     logger.error(f"Edge scan: {e}", exc_info=True)
 
@@ -158,8 +174,13 @@ async def bot_loop(clob, positions, bot_state):
                 last["arber"] = now
                 bot_state["last_arber_scan"] = now
                 try:
-                    for s in await scan_arber(clob, positions):
+                    arber_signals = await scan_arber(clob, positions)
+                    bot_state["markets_scanned"] = bot_state.get("markets_scanned", 0) + 1
+                    if arber_signals:
+                        log(f"🔄 {len(arber_signals)} arb opportunities", level="signal", engine="arber")
+                    for s in arber_signals:
                         await execute_arber(s, clob, positions)
+                        log(f"🔄 ARB {s.market_question[:40]}… profit {s.profit_pct:.1%}", level="trade", engine="arber")
                 except Exception as e:
                     logger.error(f"Arber: {e}", exc_info=True)
 
@@ -189,7 +210,22 @@ async def bot_loop(clob, positions, bot_state):
 
 
 async def main():
-    bot_state = {"started_at": time.time(), "scan_count": 0, "live_games": []}
+    bot_state = {
+        "started_at": time.time(), "scan_count": 0, "live_games": [],
+        "scan_log": [],        # rolling activity feed for dashboard
+        "edges_found": [],     # recent edges (traded or not) for scanner view
+        "markets_scanned": 0,  # total markets checked
+    }
+
+    def log_event(msg, level="info", engine=""):
+        """Add to rolling scan log (keeps last 50 entries)."""
+        bot_state["scan_log"].append({
+            "t": time.time(), "msg": msg, "level": level, "engine": engine,
+        })
+        if len(bot_state["scan_log"]) > 50:
+            bot_state["scan_log"] = bot_state["scan_log"][-50:]
+
+    bot_state["log_event"] = log_event
     clob = ClobInterface()
     if not clob.initialize():
         logger.error("CLOB init failed — degraded mode")
