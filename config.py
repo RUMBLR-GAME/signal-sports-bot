@@ -1,11 +1,12 @@
 """
-config.py — Signal Harvest + Synth Bot v2
+config.py — Signal Harvest Bot v3
 
-Two engines, one bankroll:
-  ENGINE 1 (Harvest): ESPN verified sports blowouts → Polymarket
-  ENGINE 2 (Synth):   Bittensor SN50 crypto predictions → Polymarket
+Sports blowout harvester with live Polymarket execution.
+Maker limit orders only (zero fees + rebates).
 
-Both compound into the same equity pool.
+Architecture:
+  ESPN live scores → blowout detection → Polymarket CLOB match →
+  real orderbook price → EV check → maker limit order → hold to resolution
 """
 
 import os
@@ -21,38 +22,32 @@ CLOB_HOST = "https://clob.polymarket.com"
 CHAIN_ID = 137
 PRIVATE_KEY = os.getenv("POLYMARKET_PRIVATE_KEY", "")
 FUNDER_ADDRESS = os.getenv("POLYMARKET_FUNDER_ADDRESS", "")
+# 0=EOA (own wallet), 1=POLY_PROXY (MagicLink/email), 2=GNOSIS_SAFE
+SIGNATURE_TYPE = int(os.getenv("SIGNATURE_TYPE", "1"))
 
 # ═══ BANKROLL ═══
 STARTING_BANKROLL = float(os.getenv("STARTING_BANKROLL", "1000"))
 
-# ═══ GLOBAL RISK ═══
-MAX_TOTAL_EXPOSURE_PCT = 0.80      # 80% of equity across BOTH engines
-MIN_SHARES = 5
+# ═══ RISK MANAGEMENT ═══
+MAX_EXPOSURE_PCT = 0.60            # Never expose more than 60% of equity
+MAX_SINGLE_BET_PCT = 0.10          # Never bet more than 10% on one trade
+MAX_SINGLE_BET_USD = 150.0         # Hard USD cap per trade
+MIN_SHARES = 5                     # Minimum order size (CLOB minimum)
+MIN_EV = 0.015                     # Minimum EV per share to trade ($0.015)
 
 # ═══ KELLY CRITERION ═══
-KELLY_FRACTION = 0.25              # Quarter-Kelly — aggressive but not reckless
-KELLY_MAX_BET_PCT = 0.12           # Never bet more than 12% of equity on one trade
-KELLY_MIN_EDGE = 0.02              # Minimum edge to trade (EV > 2% of cost)
+KELLY_FRACTION = 0.25              # Quarter-Kelly
+KELLY_MAX_PCT = 0.10               # Cap at 10% even if Kelly says more
 
-# ════════════════════════════════════════════
-# ENGINE 1: HARVEST (ESPN Sports)
-# ════════════════════════════════════════════
-HARVEST_ENABLED = os.getenv("HARVEST_ENABLED", "true").lower() == "true"
-HARVEST_POSITION_PCT = 0.10        # 10% of equity per harvest
-HARVEST_MAX_USD = 150.0
-HARVEST_MAX_EXPOSURE_PCT = 0.50    # 50% of equity in harvest positions
-HARVEST_MIN_VOLUME = 500
+# ═══ HARVEST SETTINGS ═══
+# Price gates — only buy shares in this range
+PRICE_MIN = 0.85                   # Don't buy below 85¢ (too much risk)
+PRICE_MAX = 0.97                   # Don't buy above 97¢ (not enough return)
+MIN_RETURN = 0.025                 # Minimum implied return (2.5%)
+MIN_VOLUME = 500                   # Minimum market volume (liquidity filter)
+MAX_SPREAD = 0.06                  # Skip if CLOB spread > 6%
 
-# Price thresholds
-HARVEST_VERIFIED_MIN = 0.85
-HARVEST_VERIFIED_MAX = 0.97
-HARVEST_UNVERIFIED_MIN = 0.93
-HARVEST_MIN_RETURN = 0.025
-
-# Harvest uses CLOB for real prices too
-HARVEST_USE_CLOB = True            # Query real orderbook for sports markets
-
-# ESPN (free, no key)
+# ═══ ESPN (free, no key) ═══
 ESPN_BASE = "https://site.api.espn.com/apis/site/v2/sports"
 ESPN_SPORTS = {
     "nba":   {"url": f"{ESPN_BASE}/basketball/nba/scoreboard",         "poly_tags": ["nba", "basketball"]},
@@ -78,7 +73,7 @@ WIN_THRESHOLDS = {
     "soccer": [(3,0.50,0.995,"blowout"),(2,0.66,0.985,"strong"),(2,0.83,0.992,"safe")],
 }
 
-# Futures keywords to block
+# Futures/props keywords to block (we only want moneyline game outcomes)
 FUTURES_BLOCK = {
     "champion","end of 2025","end of 2026","end of 2027","pound-for-pound",
     "fight next","next fight","become a","mvp","rookie of","award","season",
@@ -87,50 +82,20 @@ FUTURES_BLOCK = {
     "ballon d'or","heisman","cy young","all-star","draft","transfer",
 }
 
-# ════════════════════════════════════════════
-# ENGINE 2: SYNTH (Bittensor SN50 Crypto)
-# ════════════════════════════════════════════
-SYNTH_ENABLED = os.getenv("SYNTH_ENABLED", "true").lower() == "true"
-SYNTH_API_KEY = os.getenv("SYNTH_API_KEY", "")
-SYNTH_BASE = "https://api.synthdata.co"
+# ═══ ORDER EXECUTION ═══
+ORDER_TIMEOUT = 90                 # Cancel unfilled limit orders after 90s
+FILL_POLL_INTERVAL = 5             # Poll for fills every 5s
+POST_FILL_DELAY = 0.5              # Wait 500ms after fill before balance check
+RATE_LIMIT_PER_MIN = 55            # Stay under CLOB's 60/min limit
 
-# Position sizing per timeframe (Kelly overrides pct when edge is known)
-SYNTH_SIZING = {
-    "5min":  {"pct": 0.06, "max_usd": 80,  "min_edge": 0.03},   # 6% equity — highest conviction
-    "15min": {"pct": 0.04, "max_usd": 60,  "min_edge": 0.05},   # 4% equity, small & frequent
-    "hourly": {"pct": 0.06, "max_usd": 100, "min_edge": 0.07},   # 6% equity, medium
-    "daily":  {"pct": 0.08, "max_usd": 120, "min_edge": 0.08},   # 8% equity, big conviction
-}
-SYNTH_MAX_EXPOSURE_PCT = 0.40      # 40% of equity in synth positions
-SYNTH_ASSETS = ["BTC", "ETH", "SOL"]
-
-# ═══ ARB DETECTION ═══
-ARB_ENABLED = True                 # Layer 3: pair arbitrage
-ARB_MAX_COMBINED = 0.97            # Buy both sides if YES+NO < this
-ARB_MAX_USD = 50                   # Cap per arb
-
-# ═══ SMART SCAN TIMING ═══
-# Instead of fixed intervals, the synth engine calculates exact sleep times
-# to wake up at the optimal moment before each window close.
-SNIPE_LEAD_TIME = 20               # Wake up this many seconds before window close
-SNIPE_SCAN_BURST = 3               # Seconds between scans during the hot zone
-
-# ═══ SCAN INTERVALS ═══
-HARVEST_SCAN_INTERVAL = int(os.getenv("HARVEST_INTERVAL", "90"))
-SYNTH_SCAN_INTERVAL = int(os.getenv("SYNTH_INTERVAL", "15"))   # Fallback only — smart timing overrides
-
-# ═══ RESOLUTION ═══
-CRYPTO_RESOLVE_BUFFER = 20         # Seconds after window close to resolve (was 60)
+# ═══ SCAN TIMING ═══
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "60"))  # Seconds between scans
+RESOLUTION_INTERVAL = 120          # Check for resolved markets every 2min
 
 # ═══ PERSISTENCE ═══
-# Redis URL for state persistence across Railway deploys
-# Free tier: https://upstash.com (or Railway Redis addon)
 REDIS_URL = os.getenv("REDIS_URL", "")
+STATE_FILE = os.getenv("STATE_FILE", "./data/state.json")
+TRADE_LOG = os.getenv("TRADE_LOG", "./data/trades.jsonl")
 
 # ═══ API SERVER ═══
-API_AUTH_TOKEN = os.getenv("API_AUTH_TOKEN", "")
-
-# ═══ LOGGING ═══
-LOG_DIR = os.getenv("LOG_DIR", "./logs")
-TRADE_LOG = os.path.join(LOG_DIR, "trades.jsonl")
-BANKROLL_LOG = os.path.join(LOG_DIR, "bankroll.jsonl")
+API_PORT = int(os.getenv("PORT", "3001"))

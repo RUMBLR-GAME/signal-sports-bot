@@ -1,324 +1,284 @@
 """
-main.py v2 — Signal Harvest + Synth Bot
+main.py — Signal Harvest Bot v3
 
-Changes from v1:
-- Smart scan timing (sleeps until T-20s before window close)
-- EV displayed in trade logs
-- Harvest trades pass CLOB price fields
-- Arb trades handled in synth engine
+Single-engine sports blowout harvester.
+Scan → Execute → Track → Resolve → Repeat.
+
+Paper mode: simulates execution, tracks virtual bankroll.
+Live mode: places maker limit orders on Polymarket CLOB.
 """
 
 import time
 import sys
 import os
-import json
-import threading
 from datetime import datetime, timezone
 from dataclasses import asdict
 
 import config
-from espn import fetch_verified_games
-from markets import scan_for_harvests
-from crypto import (scan_crypto_opportunities, get_synth_status,
-                     start_binance_feed, get_next_scan_delay)
-from compound import BankrollManager
-from api_server import (start_api, update, set_games, set_harvest_targets,
-                         set_synth_signals, add_trade, add_log)
+from scanner import scan, HarvestSignal
+from positions import PositionManager
+from clob import (
+    is_authenticated, place_limit_buy, cancel_order,
+    check_order_filled, get_balance, health_check,
+)
+from api import start as start_api, update_state, add_log
 
-bank = BankrollManager()
-bank_lock = threading.Lock()
-cycle_count = {"harvest": 0, "synth": 0}
-
-
-def log(msg, engine=""):
-    tag = f"[{engine.upper()}] " if engine else ""
-    print(f"  {tag}{msg}")
-    add_log(f"{tag}{msg}")
+# ── State ──
+positions = PositionManager()
+bankroll = config.STARTING_BANKROLL  # Paper bankroll (live uses CLOB balance)
+scan_count = 0
 
 
-def push_state():
-    with bank_lock:
-        stats = bank.get_stats()
-        positions = bank.get_open()
-    update(
-        bankroll=stats["bankroll"], starting=stats["starting"],
-        pnl=stats["pnl"], equity=stats["equity"],
-        trades=stats["trades"], wins=stats["wins"],
-        win_rate=stats["win_rate"], open_count=stats["open"],
-        exposure=stats["exposure"],
-        harvest_exposure=stats["harvest_exposure"],
-        synth_exposure=stats["synth_exposure"],
-        drawdown=stats["drawdown"],
-        harvest_trades=stats["harvest_trades"],
-        synth_trades=stats["synth_trades"],
-        scan_count=cycle_count["harvest"] + cycle_count["synth"],
-        open_positions=[asdict(p) for p in positions],
+def log(msg: str):
+    ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+    print(f"  [{ts}] {msg}")
+    add_log(msg)
+
+
+def push_dashboard():
+    """Push current state to dashboard API."""
+    stats = positions.get_stats(bankroll)
+    open_pos = positions.get_open()
+    update_state(
+        **stats,
+        open_positions=[asdict(p) for p in open_pos],
+        scan_count=scan_count,
+        last_scan=datetime.now(timezone.utc).isoformat(),
     )
 
 
-# ═══════════════════════════════════════════════
-# ENGINE 1: HARVEST
-# ═══════════════════════════════════════════════
-def harvest_loop():
+# ══════════════════════════════════════════════════
+# MAIN ENGINE LOOP
+# ══════════════════════════════════════════════════
+
+def engine_loop():
+    global bankroll, scan_count
+
+    # ── Restore bankroll from persisted state ──
+    # bankroll = starting - sum(open costs) + sum(resolved payouts)
+    open_cost = sum(p.cost_basis for p in positions.get_open())
+    bankroll = config.STARTING_BANKROLL - open_cost + positions.total_pnl
+    if positions.total_trades > 0:
+        log(f"Restored bankroll: ${bankroll:.2f} ({positions.total_trades} trades, ${positions.total_pnl:+.2f} P&L)")
+
     while True:
         try:
-            cycle_count["harvest"] += 1
-            now = datetime.now(timezone.utc)
-            update(scanning=True, last_scan=now.isoformat())
+            scan_count += 1
 
-            with bank_lock:
-                resolved = bank.check_resolutions(engine="harvest")
-            if resolved:
-                for pos in resolved:
-                    icon = "✓" if pos.pnl > 0 else "✗"
-                    log(f"{icon} {pos.event} → ${pos.pnl:+.2f} ({pos.status})", "harvest")
-                    add_trade(_trade_dict(pos))
+            # ── Phase 1: Resolve ──
+            resolved = positions.check_resolutions()
+            for pos in resolved:
+                if config.PAPER_MODE:
+                    bankroll += pos.shares * pos.exit_price
+                icon = "✓" if pos.pnl > 0 else "✗"
+                log(f"{icon} RESOLVED {pos.outcome} → ${pos.pnl:+.2f} ({pos.status})")
 
-            games = fetch_verified_games()
-            live_games = [g for g in games if g.level != "final"]
-            set_games([{
-                "sport": g.sport, "home": g.home_abbrev, "away": g.away_abbrev,
-                "homeScore": g.home_score, "awayScore": g.away_score,
-                "leader": g.leader_team, "lead": g.lead,
-                "period": g.period, "clock": g.clock,
-                "elapsed": g.elapsed_pct, "confidence": g.confidence,
-                "level": g.level, "scoreLine": g.score_line,
-            } for g in games])
+                # Add resolved trade to dashboard history
+                existing = get_existing_trades()
+                # Update if already exists, otherwise prepend
+                updated = False
+                for i, t in enumerate(existing):
+                    if t.get("id") == pos.signal_id:
+                        existing[i]["status"] = pos.status
+                        existing[i]["pnl"] = pos.pnl
+                        existing[i]["exitPrice"] = pos.exit_price
+                        updated = True
+                        break
+                if not updated:
+                    existing.insert(0, {
+                        "id": pos.signal_id, "engine": "harvest", "sport": pos.sport,
+                        "event": pos.event, "outcome": pos.outcome,
+                        "entryPrice": pos.entry_price, "shares": pos.shares,
+                        "cost": pos.cost_basis, "confidence": pos.confidence,
+                        "level": pos.level, "scoreLine": pos.detail,
+                        "priceSource": pos.price_source, "spread": pos.spread_at_entry,
+                        "ev": pos.ev_at_entry, "status": pos.status,
+                        "pnl": pos.pnl, "exitPrice": pos.exit_price,
+                        "timestamp": pos.resolved_time or pos.entry_time,
+                    })
+                update_state(trade_history=existing[:300])
+                push_dashboard()
 
-            if live_games:
-                log(f"{len(live_games)} live verified games ({len(games)} total)", "harvest")
+            # ── Phase 2: Check fills on pending orders ──
+            if not config.PAPER_MODE:
+                for pos in positions.positions:
+                    if pos.status == "open" and pos.order_id:
+                        fill = check_order_filled(pos.order_id)
+                        if fill and fill.get("filled"):
+                            pos.status = "filled"
+                            log(f"FILL {pos.outcome} → {pos.shares}× @ ${pos.entry_price:.4f}")
+                            positions._save()
+
+                # Cancel stale unfilled orders
+                now = time.time()
+                for pos in positions.positions:
+                    if pos.status == "open" and pos.order_id and pos.entry_time:
+                        age = now - datetime.fromisoformat(pos.entry_time).timestamp()
+                        if age > config.ORDER_TIMEOUT:
+                            if cancel_order(pos.order_id):
+                                positions.cancel(pos)
+                                if config.PAPER_MODE:
+                                    bankroll += pos.cost_basis
+                                log(f"CANCELLED stale order: {pos.outcome} (age {age:.0f}s)")
+
+            # ── Phase 3: Scan for new opportunities ──
+            equity = bankroll if config.PAPER_MODE else get_balance().get("balance", bankroll)
+            exposure = positions.get_exposure()
+
+            result = scan(equity, exposure)
+            # scan() returns (signals, games) tuple
+            if isinstance(result, tuple):
+                signals, games = result
             else:
-                log(f"No live games ({len(games)} final)", "harvest")
+                signals, games = result, []
 
-            with bank_lock:
-                eq = bank.get_equity()
-                h_exp = bank.get_engine_exposure("harvest")
-            targets = scan_for_harvests(live_games, eq, h_exp)
-            set_harvest_targets([{
-                "id": t.id, "sport": t.sport, "event": t.event_title,
-                "outcome": t.outcome, "price": t.price, "shares": t.shares,
-                "cost": t.cost, "return": t.implied_return,
-                "confidence": t.confidence, "level": t.level,
-                "scoreLine": t.score_line, "leader": t.leader_team,
-                "priceSource": t.price_source, "spread": t.spread,
-                "ev": t.ev,
-            } for t in targets])
+            # Push games to dashboard
+            update_state(
+                verified_games=[{
+                    "sport": g.sport, "home": g.home_abbrev, "away": g.away_abbrev,
+                    "homeScore": g.home_score, "awayScore": g.away_score,
+                    "leader": g.leader_team, "lead": g.lead,
+                    "period": g.period, "clock": g.clock,
+                    "elapsed": g.elapsed_pct, "confidence": g.confidence,
+                    "level": g.level, "scoreLine": g.score_line,
+                } for g in (games if isinstance(games, list) else [])],
+                harvest_targets=[{
+                    "id": s.id, "sport": s.sport, "event": s.event_title,
+                    "outcome": s.outcome, "price": s.price, "shares": s.shares,
+                    "cost": s.cost, "return": s.implied_return,
+                    "confidence": s.confidence, "level": s.level,
+                    "scoreLine": s.score_line, "leader": s.leader_team,
+                    "priceSource": s.price_source, "spread": s.spread,
+                    "ev": s.ev_per_share,
+                } for s in signals],
+            )
 
-            for t in targets[:8]:
-                with bank_lock:
-                    ok, reason = bank.can_trade(t.cost, t.condition_id, "harvest")
-                    if not ok:
-                        continue
-                    bank.open_position(
-                        signal_id=t.id, engine="harvest", sport=t.sport,
-                        event=t.event_title, outcome=t.outcome, side=t.side,
-                        token_id=t.token_id, condition_id=t.condition_id,
-                        entry_price=t.price, shares=t.shares,
-                        confidence=t.confidence, level=t.level,
-                        detail=t.score_line,
+            if signals:
+                log(f"{len(signals)} harvest signals found")
+
+            # ── Phase 4: Execute ──
+            for sig in signals[:8]:  # Max 8 trades per cycle
+                # Duplicate check
+                if positions.has_position(sig.condition_id):
+                    continue
+
+                # ── LIVE EXECUTION ──
+                if not config.PAPER_MODE and is_authenticated():
+                    result = place_limit_buy(
+                        token_id=sig.token_id,
+                        price=sig.price,
+                        size=sig.shares,
                     )
-                src = "LIVE" if t.price_source == "clob" else "GAMMA"
-                log(f"HARVEST {t.shares}× {t.outcome} @ ${t.price:.4f} [{src}] → {t.implied_return:.1%} EV:{t.ev:+.4f} │ {t.score_line}", "harvest")
-                add_trade({"id": t.id, "engine": "harvest", "sport": t.sport,
-                           "event": t.event_title, "outcome": t.outcome,
-                           "entryPrice": t.price, "shares": t.shares,
-                           "cost": t.cost, "return": t.implied_return,
-                           "confidence": t.confidence, "level": t.level,
-                           "scoreLine": t.score_line, "status": "open",
-                           "pnl": None, "timestamp": now.isoformat(),
-                           "priceSource": t.price_source, "spread": t.spread,
-                           "ev": t.ev})
+                    if result.success:
+                        pos = positions.open(sig, order_id=result.order_id)
+                        src = "LIVE" if sig.price_source == "clob" else "GAMMA"
+                        log(
+                            f"ORDER {sig.shares}× {sig.outcome} @ ${sig.price:.4f} [{src}] "
+                            f"→ {result.order_id[:16]} │ EV:+{sig.ev_per_share*100:.1f}¢ │ {sig.score_line}"
+                        )
+                    else:
+                        log(f"ORDER FAILED: {result.error} │ {sig.outcome}")
 
-            push_state()
-            update(scanning=False, engines={**_engines()})
-            time.sleep(config.HARVEST_SCAN_INTERVAL)
+                # ── PAPER EXECUTION ──
+                else:
+                    if sig.cost <= bankroll:
+                        bankroll -= sig.cost
+                        pos = positions.open(sig)
+                        src = "LIVE" if sig.price_source == "clob" else "GAMMA"
+                        log(
+                            f"PAPER {sig.shares}× {sig.outcome} @ ${sig.price:.4f} [{src}] "
+                            f"→ {sig.implied_return:.1%} │ EV:+{sig.ev_per_share*100:.1f}¢ │ {sig.score_line}"
+                        )
+
+                # Push after each trade
+                push_dashboard()
+
+                # Add to dashboard trade history
+                update_state(trade_history=[{
+                    "id": sig.id, "engine": "harvest", "sport": sig.sport,
+                    "event": sig.event_title, "outcome": sig.outcome,
+                    "entryPrice": sig.price, "shares": sig.shares,
+                    "cost": sig.cost, "confidence": sig.confidence,
+                    "level": sig.level, "scoreLine": sig.score_line,
+                    "priceSource": sig.price_source, "spread": sig.spread,
+                    "ev": sig.ev_per_share, "status": "open", "pnl": None,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }] + (get_existing_trades()))
+
+            push_dashboard()
+            time.sleep(config.SCAN_INTERVAL)
 
         except Exception as e:
-            log(f"Error: {e}", "harvest")
-            import traceback; traceback.print_exc()
+            log(f"ERROR: {e}")
+            import traceback
+            traceback.print_exc()
             time.sleep(30)
 
 
-# ═══════════════════════════════════════════════
-# ENGINE 2: SYNTH (with smart scan timing)
-# ═══════════════════════════════════════════════
-def synth_loop():
-    while True:
-        try:
-            cycle_count["synth"] += 1
-            now = datetime.now(timezone.utc)
-
-            with bank_lock:
-                eq = bank.get_equity()
-                s_exp = bank.get_engine_exposure("synth")
-
-            with bank_lock:
-                resolved = bank.check_resolutions(engine="synth")
-            if resolved:
-                for pos in resolved:
-                    if pos.engine == "synth":
-                        icon = "✓" if pos.pnl > 0 else "✗"
-                        log(f"{icon} {pos.event} → ${pos.pnl:+.2f} ({pos.status})", "synth")
-                        add_trade(_trade_dict(pos))
-
-            signals = scan_crypto_opportunities(eq, s_exp)
-            set_synth_signals([{
-                "id": s.id, "asset": s.asset, "timeframe": s.timeframe,
-                "direction": s.direction, "synthProb": s.synth_prob_up,
-                "polyProb": s.poly_prob_up, "edge": s.edge,
-                "edgePct": round(s.edge * 100, 1), "confidence": s.confidence,
-                "price": s.price, "side": s.side,
-                "eventEnd": s.event_end, "currentPrice": 0,
-                "shares": s.shares, "cost": s.cost,
-                "timestamp": s.timestamp,
-                "priceSource": s.price_source,
-                "realPrice": s.real_price,
-                "midpoint": s.midpoint,
-                "spread": s.spread,
-                "ev": s.ev,
-                "layer": s.layer,
-            } for s in signals])
-
-            if signals:
-                log(f"{len(signals)} signals ({', '.join(s.layer for s in signals)})", "synth")
-
-            for sig in signals:
-                with bank_lock:
-                    ok, reason = bank.can_trade(sig.cost, sig.slug or sig.id, "synth")
-                    if not ok:
-                        continue
-                    bank.open_position(
-                        signal_id=sig.id, engine="synth", sport=sig.asset,
-                        event=f"{sig.asset} {sig.timeframe} {sig.direction}",
-                        outcome=f"{sig.asset} {sig.direction.upper()}",
-                        side=sig.side, token_id=sig.token_id,
-                        condition_id=sig.slug or sig.id,
-                        entry_price=sig.price, shares=sig.shares,
-                        confidence=sig.confidence,
-                        level=sig.layer,
-                        detail=sig.detail,
-                    )
-                source_tag = "LIVE" if sig.price_source == "clob" else "EST"
-                log(f"{sig.layer.upper()} {sig.asset} {sig.timeframe} {sig.direction.upper()} @ ${sig.price:.4f} [{source_tag}] │ EV:{sig.ev:+.4f} │ Δ:{sig.window_delta_pct:+.3f}%", "synth")
-                add_trade({"id": sig.id, "engine": "synth", "sport": sig.asset,
-                           "event": f"{sig.asset} {sig.timeframe}",
-                           "outcome": f"{sig.direction.upper()}", "side": sig.side,
-                           "entryPrice": sig.price, "shares": sig.shares,
-                           "cost": sig.cost, "edge": sig.edge,
-                           "edgePct": round(sig.edge * 100, 1),
-                           "confidence": sig.confidence,
-                           "synthProb": sig.synth_prob_up, "polyProb": sig.poly_prob_up,
-                           "timeframe": sig.timeframe, "status": "open",
-                           "pnl": None, "timestamp": now.isoformat(),
-                           "priceSource": sig.price_source,
-                           "realPrice": sig.real_price,
-                           "midpoint": sig.midpoint,
-                           "spread": sig.spread,
-                           "ev": sig.ev,
-                           "layer": sig.layer,
-                           })
-
-            push_state()
-            update(engines={**_engines()})
-
-            # ── Smart scan timing ──
-            delay = get_next_scan_delay()
-            time.sleep(delay)
-
-        except Exception as e:
-            log(f"Error: {e}", "synth")
-            import traceback; traceback.print_exc()
-            time.sleep(10)
+def get_existing_trades() -> list:
+    """Get existing trade history from dashboard state."""
+    from api import get_state
+    return get_state().get("trade_history", [])[:299]
 
 
-def _trade_dict(pos) -> dict:
-    return {"id": pos.signal_id, "engine": pos.engine, "sport": pos.sport,
-            "event": pos.event, "outcome": pos.outcome, "side": pos.side,
-            "entryPrice": pos.entry_price, "exitPrice": pos.exit_price,
-            "shares": pos.shares, "cost": pos.cost_basis,
-            "confidence": pos.confidence, "level": pos.level,
-            "detail": pos.detail, "status": pos.status,
-            "pnl": pos.pnl, "timestamp": pos.resolved_time or pos.entry_time}
-
-
-def _engines():
-    return {"harvest": config.HARVEST_ENABLED, "synth": config.SYNTH_ENABLED}
-
+# ══════════════════════════════════════════════════
+# STARTUP
+# ══════════════════════════════════════════════════
 
 def main():
+    global bankroll
+
     print()
-    print("▓" * 64)
-    print("▓  SIGNAL │ HARVEST + SYNTH  v2                              ▓")
-    print("▓  Dual-Engine Compound Machine                              ▓")
-    print("▓" * 64)
+    print("▓" * 56)
+    print("▓  SIGNAL HARVEST v3                                ▓")
+    print("▓  Sports Blowout Harvester · Maker Limit Orders    ▓")
+    print("▓" * 56)
     print()
+
     mode = "PAPER" if config.PAPER_MODE else "!! LIVE !!"
     print(f"  Mode:       {mode}")
     print(f"  Bankroll:   ${config.STARTING_BANKROLL:.2f}")
-    print(f"  Kelly:      {config.KELLY_FRACTION}× (max {config.KELLY_MAX_BET_PCT:.0%}/trade)")
+    print(f"  Sports:     {len(config.ESPN_SPORTS)}")
+    print(f"  Price:      ${config.PRICE_MIN:.2f} – ${config.PRICE_MAX:.2f}")
+    print(f"  Max spread: {config.MAX_SPREAD:.0%}")
+    print(f"  Min EV:     ${config.MIN_EV:.3f}/share")
+    print(f"  Kelly:      {config.KELLY_FRACTION}× (max {config.KELLY_MAX_PCT:.0%})")
+    print(f"  Scan:       every {config.SCAN_INTERVAL}s")
     print()
-    print(f"  ENGINE 1 — HARVEST (ESPN Sports)")
-    print(f"    Status:   {'ON' if config.HARVEST_ENABLED else 'OFF'}")
-    print(f"    Sports:   {len(config.ESPN_SPORTS)}")
-    print(f"    CLOB:     {'Real prices' if config.HARVEST_USE_CLOB else 'Gamma only'}")
-    print(f"    Interval: {config.HARVEST_SCAN_INTERVAL}s")
-    print()
-    synth_st = get_synth_status()
-    print(f"  ENGINE 2 — SYNTH (Bittensor SN50)")
-    print(f"    Status:   {'ON' if config.SYNTH_ENABLED else 'OFF'} │ {synth_st['message']}")
-    print(f"    Assets:   {', '.join(config.SYNTH_ASSETS)}")
-    print(f"    Timing:   Smart (T-{config.SNIPE_LEAD_TIME}s wake, {config.SNIPE_SCAN_BURST}s burst)")
-    print(f"    Arb:      {'ON' if config.ARB_ENABLED else 'OFF'}")
-    print(f"    Resolve:  {config.CRYPTO_RESOLVE_BUFFER}s buffer")
-    print()
-    print("─" * 64)
 
-    os.makedirs(config.LOG_DIR, exist_ok=True)
+    # Auth status
+    clob = health_check()
+    print(f"  CLOB read:  {'✓' if clob['read'] else '✗'}")
+    print(f"  CLOB auth:  {'✓' if clob['auth'] else '✗ (paper only)'}")
+    if not clob["auth"] and not config.PAPER_MODE:
+        print("  !! LIVE MODE but no CLOB auth — will not place orders")
+    print()
+    print("─" * 56)
+
+    # Load persisted state
+    stats = positions.get_stats(bankroll)
+    if stats["trades"] > 0:
+        print(f"  Restored: {stats['trades']} trades, ${stats['pnl']:+.2f} P&L")
+
+    # Start API
+    os.makedirs(os.path.dirname(config.STATE_FILE) or "data", exist_ok=True)
     start_api()
-    try:
-        start_binance_feed()
-    except Exception as e:
-        print(f"  [WARN] Binance feed failed: {e}")
-    push_state()
-    update(engines=_engines())
+    push_dashboard()
 
-    if config.PAPER_MODE:
-        log("Paper mode — no real trades")
-    else:
-        confirm = input("  LIVE MODE — type 'CONFIRM': ")
+    if not config.PAPER_MODE:
+        print()
+        confirm = input("  LIVE MODE — type 'CONFIRM' to proceed: ")
         if confirm.strip() != "CONFIRM":
+            print("  Aborted.")
             sys.exit(0)
 
-    threads = []
+    log(f"Engine started ({mode})")
 
-    if config.HARVEST_ENABLED:
-        t1 = threading.Thread(target=harvest_loop, daemon=True, name="harvest")
-        t1.start()
-        threads.append(t1)
-        log("Harvest engine started (Kelly + CLOB)", "harvest")
-
-    if config.SYNTH_ENABLED:
-        t2 = threading.Thread(target=synth_loop, daemon=True, name="synth")
-        t2.start()
-        threads.append(t2)
-        log("Crypto engine started (EV + Kelly + smart timing + arb)", "synth")
-
-    if not threads:
-        log("No engines enabled!")
-        sys.exit(1)
-
+    # Single engine loop
     try:
-        while True:
-            time.sleep(60)
-            with bank_lock:
-                stats = bank.get_stats()
-            print(f"\n  ── {datetime.now(timezone.utc).strftime('%H:%M')} UTC │ "
-                  f"Equity: ${stats['equity']:.2f} │ P&L: ${stats['pnl']:+.2f} │ "
-                  f"Open: {stats['open']} │ WR: {stats['win_rate']:.1%} │ "
-                  f"H:{stats['harvest_trades']} S:{stats['synth_trades']}")
+        engine_loop()
     except KeyboardInterrupt:
-        with bank_lock:
-            stats = bank.get_stats()
+        stats = positions.get_stats(bankroll)
         print(f"\n\n  ═══ SESSION END ═══")
         print(f"  Equity:  ${stats['equity']:.2f}")
         print(f"  P&L:    ${stats['pnl']:+.2f} ({stats['roi']:+.1f}%)")
