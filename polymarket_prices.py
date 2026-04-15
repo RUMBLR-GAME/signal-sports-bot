@@ -1,10 +1,13 @@
 """
-polymarket_prices.py — Real Polymarket CLOB price fetcher
+polymarket_prices.py — Real Polymarket CLOB price fetcher v2
+
 Queries actual orderbook prices via py-clob-client.
 NO wallet/auth needed for price reads.
 
-Drop this file alongside crypto.py in the bot root.
-Add `py-clob-client==0.34.6` to requirements.txt.
+Features:
+  - Crypto up/down market prices (slug-based)
+  - Sports market prices (token_id-based, for harvest)
+  - Pair arbitrage detection (YES+NO < threshold)
 """
 
 import time
@@ -25,28 +28,10 @@ _token_cache: dict[str, tuple[float, dict]] = {}
 TOKEN_CACHE_TTL = 60
 
 
-def _build_slug(asset: str, window_min: int) -> str:
-    """Build the Polymarket event slug for a crypto up/down market.
-
-    asset: 'BTC' or 'ETH' (uppercased from crypto.py — we lowercase here)
-    window_min: 5 or 15
-    """
-    now = int(time.time())
-    period = window_min * 60
-    window_ts = now - (now % period)
-    return f"{asset.lower()}-updown-{window_min}m-{window_ts}"
-
-
-def _build_slug_from_ts(asset: str, window_min: int, window_ts: int) -> str:
-    """Build slug using a specific window timestamp (for callers that already computed it)."""
-    return f"{asset.lower()}-updown-{window_min}m-{window_ts}"
-
-
 def _get_token_ids(slug: str) -> dict | None:
     """Fetch token IDs from Gamma API for a given slug.
     Returns {'yes': token_id, 'no': token_id} or None on failure.
     """
-    # Check cache
     if slug in _token_cache:
         cached_at, data = _token_cache[slug]
         if time.time() - cached_at < TOKEN_CACHE_TTL:
@@ -79,7 +64,6 @@ def _get_token_ids(slug: str) -> dict | None:
             logger.warning(f"Not enough token IDs for slug: {slug}")
             return None
 
-        # Map outcomes to token IDs
         result = {}
         for i, outcome in enumerate(outcomes):
             key = outcome.strip().lower()
@@ -88,16 +72,12 @@ def _get_token_ids(slug: str) -> dict | None:
             elif key in ("no", "down"):
                 result["no"] = token_ids[i]
 
-        # Fallback if outcomes don't match expected names
         if "yes" not in result:
             result["yes"] = token_ids[0]
         if "no" not in result:
             result["no"] = token_ids[1]
 
         _token_cache[slug] = (time.time(), result)
-        logger.info(
-            f"Resolved tokens for {slug}: YES={result['yes'][:12]}… NO={result['no'][:12]}…"
-        )
         return result
 
     except Exception as e:
@@ -105,70 +85,129 @@ def _get_token_ids(slug: str) -> dict | None:
         return None
 
 
+def _query_clob_price(token_id: str) -> dict | None:
+    """Query CLOB for a single token's prices. Returns parsed dict or None."""
+    try:
+        price_resp = _clob.get_price(token_id, "BUY")
+        buy = float(price_resp["price"]) if isinstance(price_resp, dict) else float(price_resp)
+
+        sell_resp = _clob.get_price(token_id, "SELL")
+        sell = float(sell_resp["price"]) if isinstance(sell_resp, dict) else float(sell_resp)
+
+        mid_resp = _clob.get_midpoint(token_id)
+        mid = float(mid_resp["mid"]) if isinstance(mid_resp, dict) else float(mid_resp)
+
+        spread_resp = _clob.get_spread(token_id)
+        spread = float(spread_resp["spread"]) if isinstance(spread_resp, dict) else float(spread_resp)
+
+        return {"buy_price": buy, "sell_price": sell, "midpoint": mid, "spread": spread}
+    except Exception as e:
+        logger.error(f"CLOB query error for token {token_id[:16]}…: {e}")
+        return None
+
+
+# ── PUBLIC API ─────────────────────────────────────────────────────
+
 def get_real_price(slug: str, direction: str) -> dict | None:
     """Get real Polymarket price for a crypto up/down market.
 
     Args:
         slug: Full Polymarket slug, e.g. "btc-updown-5m-1712345678"
-              (matches what crypto.py already builds)
         direction: 'up' or 'down'
 
-    Returns dict with price data or None on failure:
-        {
-            'slug': str,
-            'direction': str,
-            'token_id': str,
-            'buy_price': float,    # what we'd pay to buy
-            'sell_price': float,   # what we'd get selling
-            'midpoint': float,     # midpoint price
-            'spread': float,       # bid-ask spread
-            'timestamp': float,
-        }
+    Returns dict or None:
+        { slug, direction, token_id, buy_price, sell_price, midpoint, spread, timestamp }
     """
     tokens = _get_token_ids(slug)
     if not tokens:
         return None
 
-    # Pick the right token based on direction
     token_key = "yes" if direction == "up" else "no"
     token_id = tokens.get(token_key)
-
     if not token_id:
         logger.error(f"No {token_key} token for {slug}")
         return None
 
-    try:
-        # ── Get real orderbook prices from CLOB ──
-        # CLOB API returns dicts: {"price": "0.85"}, {"mid": "0.83"}, {"spread": "0.02"}
-        price_resp = _clob.get_price(token_id, "BUY")
-        buy_price = float(price_resp["price"]) if isinstance(price_resp, dict) else float(price_resp)
-
-        sell_resp = _clob.get_price(token_id, "SELL")
-        sell_price = float(sell_resp["price"]) if isinstance(sell_resp, dict) else float(sell_resp)
-
-        mid_resp = _clob.get_midpoint(token_id)
-        midpoint = float(mid_resp["mid"]) if isinstance(mid_resp, dict) else float(mid_resp)
-
-        spread_resp = _clob.get_spread(token_id)
-        spread = float(spread_resp["spread"]) if isinstance(spread_resp, dict) else float(spread_resp)
-
-        result = {
-            "slug": slug,
-            "direction": direction,
-            "token_id": token_id,
-            "buy_price": buy_price,
-            "sell_price": sell_price,
-            "midpoint": midpoint,
-            "spread": spread,
-            "timestamp": time.time(),
-        }
-
-        logger.info(
-            f"REAL PRICE {slug} {direction}: "
-            f"buy={buy_price:.4f} sell={sell_price:.4f} mid={midpoint:.4f} spread={spread:.4f}"
-        )
-        return result
-
-    except Exception as e:
-        logger.error(f"CLOB price error for {slug} ({direction}): {e}")
+    data = _query_clob_price(token_id)
+    if not data:
         return None
+
+    result = {
+        "slug": slug,
+        "direction": direction,
+        "token_id": token_id,
+        **data,
+        "timestamp": time.time(),
+    }
+
+    logger.info(
+        f"REAL PRICE {slug} {direction}: "
+        f"buy={data['buy_price']:.4f} sell={data['sell_price']:.4f} "
+        f"mid={data['midpoint']:.4f} spread={data['spread']:.4f}"
+    )
+    return result
+
+
+def get_token_price(token_id: str) -> dict | None:
+    """Get real CLOB price for any token by ID (used by harvest for sports markets).
+
+    Returns dict or None:
+        { token_id, buy_price, sell_price, midpoint, spread, timestamp }
+    """
+    if not token_id:
+        return None
+
+    data = _query_clob_price(token_id)
+    if not data:
+        return None
+
+    return {"token_id": token_id, **data, "timestamp": time.time()}
+
+
+def check_arb(slug: str) -> dict | None:
+    """Check if a crypto market has an arbitrage opportunity.
+    Buy both YES and NO when combined cost < $0.97 for risk-free profit.
+
+    Returns dict or None:
+        { slug, yes_price, no_price, combined, profit_per_share,
+          yes_token, no_token, timestamp }
+    """
+    tokens = _get_token_ids(slug)
+    if not tokens:
+        return None
+
+    yes_id = tokens.get("yes")
+    no_id = tokens.get("no")
+    if not yes_id or not no_id:
+        return None
+
+    yes_data = _query_clob_price(yes_id)
+    no_data = _query_clob_price(no_id)
+    if not yes_data or not no_data:
+        return None
+
+    combined = yes_data["buy_price"] + no_data["buy_price"]
+
+    if combined >= 1.0:
+        return None  # No arb — would lose money
+
+    profit = 1.0 - combined  # Per share pair
+
+    result = {
+        "slug": slug,
+        "yes_price": yes_data["buy_price"],
+        "no_price": no_data["buy_price"],
+        "yes_spread": yes_data["spread"],
+        "no_spread": no_data["spread"],
+        "combined": round(combined, 4),
+        "profit_per_share": round(profit, 4),
+        "yes_token": yes_id,
+        "no_token": no_id,
+        "timestamp": time.time(),
+    }
+
+    logger.info(
+        f"ARB CHECK {slug}: YES={yes_data['buy_price']:.4f} + NO={no_data['buy_price']:.4f} "
+        f"= {combined:.4f} → profit={profit:.4f}/share"
+    )
+    return result

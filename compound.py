@@ -1,15 +1,10 @@
 """
-compound.py — Dual-Engine Bankroll Manager (FINAL)
+compound.py v2 — Dual-Engine Bankroll Manager
 
-All audit findings addressed:
-- Engine-scoped resolution (harvest resolves harvest, synth resolves synth)
-- Crypto positions resolved via Binance price comparison, not Gamma API
-- Position archival: resolved positions moved to history, cleaned from active list
-- Thread-safe with explicit lock documentation
-- Atomic file writes with corruption protection
-
-IMPORTANT: All public methods assume caller holds bank_lock from main.py.
-Only check_resolutions and _save/_load do I/O, everything else is pure memory.
+Changes from v1:
+- Faster crypto resolution (configurable buffer, default 20s instead of 60s)
+- Redis persistence across Railway deploys (optional, falls back to file)
+- Archive included in state save for full recovery
 """
 
 import json
@@ -25,39 +20,52 @@ import config
 @dataclass
 class Position:
     signal_id: str
-    engine: str              # "harvest" or "synth"
-    sport: str               # Sport tag or asset symbol
-    event: str               # "Lakers vs Celtics" or "BTC 5min up"
-    outcome: str             # "Lakers" or "BTC UP"
-    side: str                # "YES" or "NO"
-    token_id: str            # Polymarket CLOB token (empty for paper)
-    condition_id: str        # Polymarket conditionId or slug-based ID
-    entry_price: float       # Price paid per share
-    shares: int              # Number of shares
-    cost_basis: float        # Total cost (shares × entry_price)
-    confidence: float        # 0-1 confidence at entry
-    level: str               # Verification level string
-    detail: str              # Human-readable context
-    entry_time: str          # ISO timestamp
-    status: str = "open"     # open / won / lost
-    exit_price: float = 0.0  # 0 or 1 for binary markets
+    engine: str
+    sport: str
+    event: str
+    outcome: str
+    side: str
+    token_id: str
+    condition_id: str
+    entry_price: float
+    shares: int
+    cost_basis: float
+    confidence: float
+    level: str
+    detail: str
+    entry_time: str
+    status: str = "open"
+    exit_price: float = 0.0
     pnl: float = 0.0
     resolved_time: str = ""
 
 
-class BankrollManager:
-    """
-    Thread-safe bankroll manager for dual-engine bot.
-    
-    All methods that read/write state should be called with bank_lock held.
-    I/O methods (check_resolutions, _save, _load) handle their own errors
-    gracefully — they never raise.
-    """
+# ── Redis persistence (optional) ─────────────────
+_redis_client = None
 
+def _get_redis():
+    global _redis_client
+    if _redis_client is not None:
+        return _redis_client
+    if not config.REDIS_URL:
+        return None
+    try:
+        import redis
+        _redis_client = redis.from_url(config.REDIS_URL, decode_responses=True)
+        _redis_client.ping()
+        print("  [PERSIST] Redis connected")
+        return _redis_client
+    except Exception as e:
+        print(f"  [PERSIST] Redis unavailable: {e}")
+        _redis_client = False  # Don't retry
+        return None
+
+
+class BankrollManager:
     def __init__(self):
         self.bankroll: float = config.STARTING_BANKROLL
-        self.positions: list[Position] = []     # Active + recently resolved
-        self.archive: list[dict] = []           # Archived resolved trades (dicts for compactness)
+        self.positions: list[Position] = []
+        self.archive: list[dict] = []
         self.hwm: float = config.STARTING_BANKROLL
         self.total_trades: int = 0
         self.total_wins: int = 0
@@ -71,7 +79,6 @@ class BankrollManager:
         return self.bankroll
 
     def get_equity(self) -> float:
-        """Cash + cost basis of all open positions."""
         return self.bankroll + sum(p.cost_basis for p in self.positions if p.status == "open")
 
     def get_open(self) -> list[Position]:
@@ -85,7 +92,6 @@ class BankrollManager:
         return sum(p.cost_basis for p in self.positions if p.status == "open")
 
     def has_position(self, condition_id: str) -> bool:
-        """True if we have an OPEN position with this condition_id."""
         if not condition_id:
             return False
         return any(p.condition_id == condition_id and p.status == "open"
@@ -94,12 +100,8 @@ class BankrollManager:
     # ── Pre-trade validation ─────────────────────────
     def can_trade(self, cost: float, condition_id: str = "",
                   engine: str = "harvest") -> tuple[bool, str]:
-        """Full pre-trade check. Returns (ok, reason)."""
-        # 1. Duplicate
         if condition_id and self.has_position(condition_id):
             return False, "Duplicate position"
-
-        # 2. Cash
         if cost <= 0:
             return False, "Zero cost"
         if cost > self.bankroll:
@@ -109,12 +111,10 @@ class BankrollManager:
         if eq <= 0:
             return False, "Zero equity"
 
-        # 3. Global exposure limit
         total_exp = self.get_total_exposure()
         if (total_exp + cost) > eq * config.MAX_TOTAL_EXPOSURE_PCT:
             return False, f"Total exposure {(total_exp + cost)/eq:.0%} > {config.MAX_TOTAL_EXPOSURE_PCT:.0%}"
 
-        # 4. Engine-specific exposure limit
         eng_exp = self.get_engine_exposure(engine)
         if engine == "harvest":
             max_eng = eq * config.HARVEST_MAX_EXPOSURE_PCT
@@ -125,8 +125,6 @@ class BankrollManager:
 
         if eng_exp + cost > max_eng:
             return False, f"{engine} exposure {(eng_exp + cost)/eq:.0%} > limit"
-
-        # 5. Per-trade USD cap
         if cost > max_usd:
             return False, f"${cost:.0f} > ${max_usd:.0f} cap"
 
@@ -157,7 +155,6 @@ class BankrollManager:
 
     # ── Close position ───────────────────────────────
     def _close(self, pos: Position, exit_price: float, status: str) -> Position:
-        """Close a position. Caller must hold bank_lock."""
         pos.status = status
         pos.exit_price = exit_price
         pos.pnl = round(pos.shares * exit_price - pos.cost_basis, 4)
@@ -175,16 +172,10 @@ class BankrollManager:
 
     # ── Resolution ───────────────────────────────────
     def check_resolutions(self, engine: str = "") -> list[Position]:
-        """
-        Check for resolved positions. Optionally filter by engine.
-        Harvest: queries Polymarket Gamma API.
-        Synth: queries Binance for actual price outcome.
-        """
         resolved = []
         for pos in list(self.positions):
             if pos.status != "open":
                 continue
-            # Filter by engine if specified
             if engine and pos.engine != engine:
                 continue
 
@@ -196,13 +187,10 @@ class BankrollManager:
             if closed:
                 resolved.append(closed)
 
-        # Archive resolved positions (keep active list clean)
         self._archive_resolved()
-
         return resolved
 
     def _resolve_harvest(self, pos: Position) -> Optional[Position]:
-        """Resolve a harvest position via Polymarket Gamma API."""
         if not pos.condition_id:
             return None
         try:
@@ -227,18 +215,14 @@ class BankrollManager:
             return None
 
     def _resolve_crypto(self, pos: Position) -> Optional[Position]:
-        """Resolve a crypto position by checking Binance for actual price outcome."""
         now = _time.time()
 
-        # Parse window timestamp from signal_id
-        # Format: "snipe-BTC-5m-1712345678" or "synth-BTC-1h-1712345678"
         parts = pos.signal_id.rsplit("-", 1)
         try:
             window_ts = int(parts[-1])
         except (ValueError, IndexError):
             return None
 
-        # Determine window duration
         sid = pos.signal_id.lower()
         if "5m" in sid:
             duration = 300
@@ -251,35 +235,36 @@ class BankrollManager:
 
         close_time = window_ts + duration
 
-        # Don't resolve until window has closed + 60s buffer
-        if now < close_time + 60:
+        # Faster resolution: configurable buffer (default 20s instead of 60s)
+        if now < close_time + config.CRYPTO_RESOLVE_BUFFER:
             return None
 
-        # Get actual prices from Binance
-        asset = pos.sport  # "BTC" or "ETH" or "SOL"
+        # Handle arb positions — they always win if market resolves
+        if pos.side == "BOTH":
+            # Arb: we bought both sides, payout is always $1 per pair
+            return self._close(pos, 1.0, "won")
+
+        asset = pos.sport
         symbol = f"{asset}USDT"
 
         try:
-            # Open price at window start
             r1 = requests.get("https://api.binance.com/api/v3/klines",
                               params={"symbol": symbol, "interval": "1m",
                                       "startTime": window_ts * 1000, "limit": 1},
                               timeout=8)
             if not r1.ok or not r1.json():
                 return None
-            open_price = float(r1.json()[0][1])  # [1] = open
+            open_price = float(r1.json()[0][1])
 
-            # Close price at window end
-            end_candle_start = (close_time - 60) * 1000  # Candle containing the close
+            end_candle_start = (close_time - 60) * 1000
             r2 = requests.get("https://api.binance.com/api/v3/klines",
                               params={"symbol": symbol, "interval": "1m",
                                       "startTime": end_candle_start, "limit": 1},
                               timeout=8)
             if not r2.ok or not r2.json():
                 return None
-            close_price = float(r2.json()[0][4])  # [4] = close
+            close_price = float(r2.json()[0][4])
 
-            # Determine actual outcome
             actual_up = close_price >= open_price
             we_bet_up = pos.side == "YES"
             won = actual_up == we_bet_up
@@ -290,8 +275,6 @@ class BankrollManager:
             return None
 
     def _parse_resolution(self, data: dict, side: str, outcome: str) -> Optional[float]:
-        """Parse resolution from Polymarket market data."""
-        # Method 1: outcomePrices array (most reliable)
         ps = data.get("outcomePrices", "")
         if isinstance(ps, str) and ps:
             try:
@@ -308,7 +291,6 @@ class BankrollManager:
             except Exception:
                 pass
 
-        # Method 2: winningOutcome text
         wo = data.get("winningOutcome", "").lower().strip()
         if not wo:
             return None
@@ -323,24 +305,20 @@ class BankrollManager:
                 return 1.0
             if wo in ("yes", "1"):
                 return 0.0
-        # Handle "NOT X" outcomes
         if ol.startswith("not ") and wo in ("no", "0"):
             return 1.0
         return None
 
     # ── Position archival ────────────────────────────
     def _archive_resolved(self):
-        """Move resolved positions to archive, keep active list clean."""
         still_active = []
         for pos in self.positions:
             if pos.status == "open":
                 still_active.append(pos)
             else:
                 self.archive.append(asdict(pos))
-        # Only rewrite if we actually archived something
         if len(still_active) < len(self.positions):
             self.positions = still_active
-            # Keep archive bounded (last 500 trades)
             if len(self.archive) > 500:
                 self.archive = self.archive[-500:]
             self._save()
@@ -351,8 +329,6 @@ class BankrollManager:
         wr = self.total_wins / self.total_trades if self.total_trades > 0 else 0
         roi = (eq / config.STARTING_BANKROLL - 1) * 100 if config.STARTING_BANKROLL > 0 else 0
         dd = (1 - eq / self.hwm) * 100 if self.hwm > 0 else 0
-        h_open = sum(1 for p in self.positions if p.engine == "harvest" and p.status == "open")
-        s_open = sum(1 for p in self.positions if p.engine == "synth" and p.status == "open")
         return {
             "bankroll": round(self.bankroll, 2), "equity": round(eq, 2),
             "starting": config.STARTING_BANKROLL, "pnl": round(self.total_pnl, 2),
@@ -369,55 +345,85 @@ class BankrollManager:
         }
 
     # ── Persistence ──────────────────────────────────
-    def _save(self):
-        """Atomic write to prevent corruption."""
-        os.makedirs(config.LOG_DIR, exist_ok=True)
-        state = {
+    def _state_dict(self) -> dict:
+        return {
             "bankroll": self.bankroll, "hwm": self.hwm,
             "total_trades": self.total_trades, "total_wins": self.total_wins,
             "total_pnl": self.total_pnl,
             "harvest_count": self.harvest_count, "synth_count": self.synth_count,
             "positions": [asdict(p) for p in self.positions],
+            "archive": self.archive[-500:],  # Include archive for full recovery
             "archive_count": len(self.archive),
             "updated": datetime.now(timezone.utc).isoformat(),
         }
+
+    def _save(self):
+        state = self._state_dict()
+
+        # Try Redis first (survives Railway redeploys)
+        r = _get_redis()
+        if r:
+            try:
+                r.set("signal_bot_state", json.dumps(state))
+            except Exception as e:
+                print(f"  [WARN] Redis save failed: {e}")
+
+        # Always save to file too (local backup)
         try:
+            os.makedirs(config.LOG_DIR, exist_ok=True)
             tmp = os.path.join(config.LOG_DIR, "state.tmp")
             path = os.path.join(config.LOG_DIR, "state.json")
             with open(tmp, "w") as f:
                 json.dump(state, f, indent=2)
             os.replace(tmp, path)
         except Exception as e:
-            print(f"  [WARN] Save failed: {e}")
+            print(f"  [WARN] File save failed: {e}")
 
     def _load(self):
-        """Load state from disk. Gracefully handles missing or corrupt files."""
-        path = os.path.join(config.LOG_DIR, "state.json")
-        if not os.path.exists(path):
-            return
-        try:
-            with open(path) as f:
-                state = json.load(f)
-            self.bankroll = state.get("bankroll", config.STARTING_BANKROLL)
-            self.hwm = state.get("hwm", self.bankroll)
-            self.total_trades = state.get("total_trades", 0)
-            self.total_wins = state.get("total_wins", 0)
-            self.total_pnl = state.get("total_pnl", 0.0)
-            self.harvest_count = state.get("harvest_count", 0)
-            self.synth_count = state.get("synth_count", 0)
-            for pd in state.get("positions", []):
-                # Gracefully handle schema changes
-                for key in ("engine", "level", "detail"):
-                    pd.setdefault(key, "unknown")
+        state = None
+
+        # Try Redis first
+        r = _get_redis()
+        if r:
+            try:
+                raw = r.get("signal_bot_state")
+                if raw:
+                    state = json.loads(raw)
+                    print("  [PERSIST] Loaded state from Redis")
+            except Exception as e:
+                print(f"  [PERSIST] Redis load failed: {e}")
+
+        # Fall back to file
+        if not state:
+            path = os.path.join(config.LOG_DIR, "state.json")
+            if os.path.exists(path):
                 try:
-                    self.positions.append(Position(**pd))
-                except (TypeError, ValueError):
-                    pass  # Skip corrupt positions
-        except Exception as e:
-            print(f"  [WARN] Load failed: {e}")
+                    with open(path) as f:
+                        state = json.load(f)
+                    print("  [PERSIST] Loaded state from file")
+                except Exception as e:
+                    print(f"  [WARN] File load failed: {e}")
+
+        if not state:
+            return
+
+        self.bankroll = state.get("bankroll", config.STARTING_BANKROLL)
+        self.hwm = state.get("hwm", self.bankroll)
+        self.total_trades = state.get("total_trades", 0)
+        self.total_wins = state.get("total_wins", 0)
+        self.total_pnl = state.get("total_pnl", 0.0)
+        self.harvest_count = state.get("harvest_count", 0)
+        self.synth_count = state.get("synth_count", 0)
+        self.archive = state.get("archive", [])
+        for pd in state.get("positions", []):
+            for key in ("engine", "level", "detail"):
+                pd.setdefault(key, "unknown")
+            try:
+                self.positions.append(Position(**pd))
+            except (TypeError, ValueError):
+                pass
 
     def _log_trade(self, pos: Position):
-        """Append resolved trade to log file."""
         try:
             os.makedirs(config.LOG_DIR, exist_ok=True)
             entry = {
@@ -429,4 +435,4 @@ class BankrollManager:
             with open(config.TRADE_LOG, "a") as f:
                 f.write(json.dumps(entry) + "\n")
         except Exception:
-            pass  # Never let logging crash the bot
+            pass

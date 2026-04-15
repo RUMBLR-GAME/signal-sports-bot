@@ -1,5 +1,5 @@
 """
-config.py — Signal Harvest + Synth Bot
+config.py — Signal Harvest + Synth Bot v2
 
 Two engines, one bankroll:
   ENGINE 1 (Harvest): ESPN verified sports blowouts → Polymarket
@@ -29,6 +29,11 @@ STARTING_BANKROLL = float(os.getenv("STARTING_BANKROLL", "1000"))
 MAX_TOTAL_EXPOSURE_PCT = 0.80      # 80% of equity across BOTH engines
 MIN_SHARES = 5
 
+# ═══ KELLY CRITERION ═══
+KELLY_FRACTION = 0.25              # Quarter-Kelly — aggressive but not reckless
+KELLY_MAX_BET_PCT = 0.12           # Never bet more than 12% of equity on one trade
+KELLY_MIN_EDGE = 0.02              # Minimum edge to trade (EV > 2% of cost)
+
 # ════════════════════════════════════════════
 # ENGINE 1: HARVEST (ESPN Sports)
 # ════════════════════════════════════════════
@@ -43,6 +48,9 @@ HARVEST_VERIFIED_MIN = 0.85
 HARVEST_VERIFIED_MAX = 0.97
 HARVEST_UNVERIFIED_MIN = 0.93
 HARVEST_MIN_RETURN = 0.025
+
+# Harvest uses CLOB for real prices too
+HARVEST_USE_CLOB = True            # Query real orderbook for sports markets
 
 # ESPN (free, no key)
 ESPN_BASE = "https://site.api.espn.com/apis/site/v2/sports"
@@ -86,8 +94,9 @@ SYNTH_ENABLED = os.getenv("SYNTH_ENABLED", "true").lower() == "true"
 SYNTH_API_KEY = os.getenv("SYNTH_API_KEY", "")
 SYNTH_BASE = "https://api.synthdata.co"
 
-# Position sizing per timeframe
+# Position sizing per timeframe (Kelly overrides pct when edge is known)
 SYNTH_SIZING = {
+    "5min":  {"pct": 0.06, "max_usd": 80,  "min_edge": 0.03},   # 6% equity — highest conviction
     "15min": {"pct": 0.04, "max_usd": 60,  "min_edge": 0.05},   # 4% equity, small & frequent
     "hourly": {"pct": 0.06, "max_usd": 100, "min_edge": 0.07},   # 6% equity, medium
     "daily":  {"pct": 0.08, "max_usd": 120, "min_edge": 0.08},   # 8% equity, big conviction
@@ -95,14 +104,28 @@ SYNTH_SIZING = {
 SYNTH_MAX_EXPOSURE_PCT = 0.40      # 40% of equity in synth positions
 SYNTH_ASSETS = ["BTC", "ETH", "SOL"]
 
-# Timeframe scan intervals (seconds)
-SYNTH_15MIN_INTERVAL = 60          # Check every 60s for 15-min markets
-SYNTH_HOURLY_INTERVAL = 120        # Check every 2min for hourly markets
-SYNTH_DAILY_INTERVAL = 300         # Check every 5min for daily markets
+# ═══ ARB DETECTION ═══
+ARB_ENABLED = True                 # Layer 3: pair arbitrage
+ARB_MAX_COMBINED = 0.97            # Buy both sides if YES+NO < this
+ARB_MAX_USD = 50                   # Cap per arb
+
+# ═══ SMART SCAN TIMING ═══
+# Instead of fixed intervals, the synth engine calculates exact sleep times
+# to wake up at the optimal moment before each window close.
+SNIPE_LEAD_TIME = 20               # Wake up this many seconds before window close
+SNIPE_SCAN_BURST = 3               # Seconds between scans during the hot zone
 
 # ═══ SCAN INTERVALS ═══
 HARVEST_SCAN_INTERVAL = int(os.getenv("HARVEST_INTERVAL", "90"))
-SYNTH_SCAN_INTERVAL = int(os.getenv("SYNTH_INTERVAL", "15"))   # 15s — must be fast to catch snipe windows
+SYNTH_SCAN_INTERVAL = int(os.getenv("SYNTH_INTERVAL", "15"))   # Fallback only — smart timing overrides
+
+# ═══ RESOLUTION ═══
+CRYPTO_RESOLVE_BUFFER = 20         # Seconds after window close to resolve (was 60)
+
+# ═══ PERSISTENCE ═══
+# Redis URL for state persistence across Railway deploys
+# Free tier: https://upstash.com (or Railway Redis addon)
+REDIS_URL = os.getenv("REDIS_URL", "")
 
 # ═══ API SERVER ═══
 API_AUTH_TOKEN = os.getenv("API_AUTH_TOKEN", "")

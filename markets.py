@@ -1,16 +1,21 @@
 """
-markets.py — Polymarket Sports Market Scanner
+markets.py v2 — Polymarket Sports Market Scanner
 
 Scans Gamma API for active sports markets.
 Matches against ESPN verified games.
-Returns harvest opportunities.
+NOW queries real CLOB prices for accurate harvest entries.
+Kelly criterion for position sizing.
 """
 
 import json
+import logging
 import requests
 from dataclasses import dataclass
 import config
 from espn import VerifiedGame, team_search_terms
+from polymarket_prices import get_token_price
+
+logger = logging.getLogger("markets")
 
 
 @dataclass
@@ -34,6 +39,28 @@ class HarvestTarget:
     elapsed_pct: float
     volume: float
     liquidity: float
+    price_source: str = "gamma"     # "gamma" or "clob"
+    spread: float = 0.0
+    ev: float = 0.0
+
+
+def _kelly_size_harvest(win_prob: float, price: float, equity: float) -> int:
+    """Kelly sizing for harvest trades."""
+    if price <= 0 or price >= 1 or win_prob <= price:
+        return 0
+
+    payout = (1.0 - price) / price
+    loss_prob = 1.0 - win_prob
+    kelly = (win_prob * payout - loss_prob) / payout
+    kelly = max(kelly, 0)
+
+    bet_fraction = kelly * config.KELLY_FRACTION
+    bet_fraction = min(bet_fraction, config.KELLY_MAX_BET_PCT,
+                       config.HARVEST_POSITION_PCT)
+
+    pos_usd = min(equity * bet_fraction, config.HARVEST_MAX_USD)
+    shares = int(pos_usd / price)
+    return shares if shares >= config.MIN_SHARES else 0
 
 
 def scan_for_harvests(verified_games: list[VerifiedGame], equity: float,
@@ -52,19 +79,38 @@ def scan_for_harvests(verified_games: list[VerifiedGame], equity: float,
     targets = []
     for game in verified_games:
         if game.level == "final":
-            continue  # Can't buy resolved markets
+            continue
         matches = _match_game(game, poly_events)
         for m in matches:
-            price = m["price"]
+            gamma_price = m["price"]
+
+            # ── Query real CLOB price if enabled ──
+            real_price = gamma_price
+            price_source = "gamma"
+            spread = 0.0
+
+            if config.HARVEST_USE_CLOB and m["token_id"]:
+                clob = get_token_price(m["token_id"])
+                if clob:
+                    real_price = clob["buy_price"]
+                    spread = clob["spread"]
+                    price_source = "clob"
+
+                    # Skip if spread is too wide (illiquid market)
+                    if spread > 0.08:
+                        logger.info(f"Harvest skip {m['outcome_label']}: spread {spread:.4f} too wide")
+                        continue
+
+            # Price gates
             if game.level in ("blowout", "strong", "safe"):
                 min_price = config.HARVEST_VERIFIED_MIN
             else:
                 min_price = config.HARVEST_UNVERIFIED_MIN
 
-            if not (min_price <= price <= config.HARVEST_VERIFIED_MAX):
+            if not (min_price <= real_price <= config.HARVEST_VERIFIED_MAX):
                 continue
 
-            ret = (1.0 - price) / price
+            ret = (1.0 - real_price) / real_price
             if ret < config.HARVEST_MIN_RETURN:
                 continue
 
@@ -72,8 +118,18 @@ def scan_for_harvests(verified_games: list[VerifiedGame], equity: float,
             if vol < config.HARVEST_MIN_VOLUME:
                 continue
 
-            pos_usd = min(equity * config.HARVEST_POSITION_PCT, config.HARVEST_MAX_USD)
-            shares = int(pos_usd / price)
+            # EV calculation
+            ev_per_share = game.confidence * 1.0 - real_price
+
+            if ev_per_share < config.KELLY_MIN_EDGE:
+                continue
+
+            # Kelly sizing
+            shares = _kelly_size_harvest(
+                win_prob=game.confidence,
+                price=real_price,
+                equity=equity,
+            )
             if shares < config.MIN_SHARES:
                 continue
 
@@ -82,18 +138,21 @@ def scan_for_harvests(verified_games: list[VerifiedGame], equity: float,
                 sport=game.sport, event_title=m["event_title"],
                 outcome=m["outcome_label"], side=m["side"],
                 token_id=m["token_id"], condition_id=m["market"]["condition_id"],
-                price=price, shares=shares, cost=round(shares * price, 2),
+                price=real_price, shares=shares, cost=round(shares * real_price, 2),
                 implied_return=round(ret, 4), confidence=game.confidence,
                 level=game.level, score_line=game.score_line,
                 leader_team=game.leader_team, lead=game.lead,
                 elapsed_pct=game.elapsed_pct, volume=vol,
                 liquidity=m["market"].get("liquidity", 0),
+                price_source=price_source,
+                spread=round(spread, 4),
+                ev=round(ev_per_share, 4),
             ))
 
-    # Dedup by condition_id, sort by confidence
+    # Dedup by condition_id, sort by EV (not just confidence)
     seen = set()
     unique = []
-    for t in sorted(targets, key=lambda x: (x.confidence, x.implied_return), reverse=True):
+    for t in sorted(targets, key=lambda x: (x.ev, x.confidence), reverse=True):
         if t.condition_id not in seen:
             seen.add(t.condition_id)
             unique.append(t)

@@ -1,12 +1,11 @@
 """
-main.py — Signal Harvest + Synth Bot
+main.py v2 — Signal Harvest + Synth Bot
 
-Two engines, one bankroll, compounding together:
-  ENGINE 1 (Harvest): ESPN → Polymarket sports (during game hours)
-  ENGINE 2 (Synth):   Bittensor SN50 → Polymarket crypto (24/7)
-
-Both engines run in their own threads.
-Both compound into the same equity pool.
+Changes from v1:
+- Smart scan timing (sleeps until T-20s before window close)
+- EV displayed in trade logs
+- Harvest trades pass CLOB price fields
+- Arb trades handled in synth engine
 """
 
 import time
@@ -20,12 +19,12 @@ from dataclasses import asdict
 import config
 from espn import fetch_verified_games
 from markets import scan_for_harvests
-from crypto import scan_crypto_opportunities, get_synth_status, start_binance_feed
+from crypto import (scan_crypto_opportunities, get_synth_status,
+                     start_binance_feed, get_next_scan_delay)
 from compound import BankrollManager
 from api_server import (start_api, update, set_games, set_harvest_targets,
                          set_synth_signals, add_trade, add_log)
 
-# Shared bankroll with thread lock
 bank = BankrollManager()
 bank_lock = threading.Lock()
 cycle_count = {"harvest": 0, "synth": 0}
@@ -67,7 +66,6 @@ def harvest_loop():
             now = datetime.now(timezone.utc)
             update(scanning=True, last_scan=now.isoformat())
 
-            # Phase 1: Resolve harvest positions only
             with bank_lock:
                 resolved = bank.check_resolutions(engine="harvest")
             if resolved:
@@ -76,7 +74,6 @@ def harvest_loop():
                     log(f"{icon} {pos.event} → ${pos.pnl:+.2f} ({pos.status})", "harvest")
                     add_trade(_trade_dict(pos))
 
-            # Phase 2: ESPN verification
             games = fetch_verified_games()
             live_games = [g for g in games if g.level != "final"]
             set_games([{
@@ -93,7 +90,6 @@ def harvest_loop():
             else:
                 log(f"No live games ({len(games)} final)", "harvest")
 
-            # Phase 3: Find and execute harvests
             with bank_lock:
                 eq = bank.get_equity()
                 h_exp = bank.get_engine_exposure("harvest")
@@ -104,9 +100,10 @@ def harvest_loop():
                 "cost": t.cost, "return": t.implied_return,
                 "confidence": t.confidence, "level": t.level,
                 "scoreLine": t.score_line, "leader": t.leader_team,
+                "priceSource": t.price_source, "spread": t.spread,
+                "ev": t.ev,
             } for t in targets])
 
-            harvested = 0
             for t in targets[:8]:
                 with bank_lock:
                     ok, reason = bank.can_trade(t.cost, t.condition_id, "harvest")
@@ -120,19 +117,20 @@ def harvest_loop():
                         confidence=t.confidence, level=t.level,
                         detail=t.score_line,
                     )
-                harvested += 1
-                log(f"HARVEST {t.shares}× {t.outcome} @ ${t.price:.2f} → {t.implied_return:.1%} │ {t.score_line}", "harvest")
+                src = "LIVE" if t.price_source == "clob" else "GAMMA"
+                log(f"HARVEST {t.shares}× {t.outcome} @ ${t.price:.4f} [{src}] → {t.implied_return:.1%} EV:{t.ev:+.4f} │ {t.score_line}", "harvest")
                 add_trade({"id": t.id, "engine": "harvest", "sport": t.sport,
                            "event": t.event_title, "outcome": t.outcome,
                            "entryPrice": t.price, "shares": t.shares,
                            "cost": t.cost, "return": t.implied_return,
                            "confidence": t.confidence, "level": t.level,
                            "scoreLine": t.score_line, "status": "open",
-                           "pnl": None, "timestamp": now.isoformat()})
+                           "pnl": None, "timestamp": now.isoformat(),
+                           "priceSource": t.price_source, "spread": t.spread,
+                           "ev": t.ev})
 
             push_state()
             update(scanning=False, engines={**_engines()})
-
             time.sleep(config.HARVEST_SCAN_INTERVAL)
 
         except Exception as e:
@@ -142,7 +140,7 @@ def harvest_loop():
 
 
 # ═══════════════════════════════════════════════
-# ENGINE 2: SYNTH
+# ENGINE 2: SYNTH (with smart scan timing)
 # ═══════════════════════════════════════════════
 def synth_loop():
     while True:
@@ -154,7 +152,6 @@ def synth_loop():
                 eq = bank.get_equity()
                 s_exp = bank.get_engine_exposure("synth")
 
-            # Phase 1: Resolve synth positions only
             with bank_lock:
                 resolved = bank.check_resolutions(engine="synth")
             if resolved:
@@ -164,7 +161,6 @@ def synth_loop():
                         log(f"{icon} {pos.event} → ${pos.pnl:+.2f} ({pos.status})", "synth")
                         add_trade(_trade_dict(pos))
 
-            # Phase 2: Scan Synth API
             signals = scan_crypto_opportunities(eq, s_exp)
             set_synth_signals([{
                 "id": s.id, "asset": s.asset, "timeframe": s.timeframe,
@@ -175,25 +171,22 @@ def synth_loop():
                 "eventEnd": s.event_end, "currentPrice": 0,
                 "shares": s.shares, "cost": s.cost,
                 "timestamp": s.timestamp,
-                # New CLOB price fields
                 "priceSource": s.price_source,
                 "realPrice": s.real_price,
                 "midpoint": s.midpoint,
                 "spread": s.spread,
+                "ev": s.ev,
+                "layer": s.layer,
             } for s in signals])
 
             if signals:
-                log(f"{len(signals)} Synth signals", "synth")
+                log(f"{len(signals)} signals ({', '.join(s.layer for s in signals)})", "synth")
 
-            # Phase 3: Execute
-            traded = 0
             for sig in signals:
                 with bank_lock:
                     ok, reason = bank.can_trade(sig.cost, sig.slug or sig.id, "synth")
                     if not ok:
                         continue
-                    # For synth, we need the Polymarket condition_id from the slug
-                    # The slug IS the market identifier — we use it as condition_id
                     bank.open_position(
                         signal_id=sig.id, engine="synth", sport=sig.asset,
                         event=f"{sig.asset} {sig.timeframe} {sig.direction}",
@@ -202,38 +195,40 @@ def synth_loop():
                         condition_id=sig.slug or sig.id,
                         entry_price=sig.price, shares=sig.shares,
                         confidence=sig.confidence,
-                        level=sig.layer,  # "snipe" or "synth"
+                        level=sig.layer,
                         detail=sig.detail,
                     )
-                traded += 1
-                edge_pct = round(sig.edge * 100, 1)
                 source_tag = "LIVE" if sig.price_source == "clob" else "EST"
-                log(f"SNIPE {sig.asset} {sig.timeframe} {sig.direction.upper()} @ ${sig.price:.4f} [{source_tag}] │ Edge:{edge_pct:+.1f}% │ Delta:{sig.window_delta_pct:+.3f}%", "synth")
+                log(f"{sig.layer.upper()} {sig.asset} {sig.timeframe} {sig.direction.upper()} @ ${sig.price:.4f} [{source_tag}] │ EV:{sig.ev:+.4f} │ Δ:{sig.window_delta_pct:+.3f}%", "synth")
                 add_trade({"id": sig.id, "engine": "synth", "sport": sig.asset,
                            "event": f"{sig.asset} {sig.timeframe}",
                            "outcome": f"{sig.direction.upper()}", "side": sig.side,
                            "entryPrice": sig.price, "shares": sig.shares,
                            "cost": sig.cost, "edge": sig.edge,
-                           "edgePct": edge_pct, "confidence": sig.confidence,
+                           "edgePct": round(sig.edge * 100, 1),
+                           "confidence": sig.confidence,
                            "synthProb": sig.synth_prob_up, "polyProb": sig.poly_prob_up,
                            "timeframe": sig.timeframe, "status": "open",
                            "pnl": None, "timestamp": now.isoformat(),
-                           # New CLOB price fields for dashboard
                            "priceSource": sig.price_source,
                            "realPrice": sig.real_price,
                            "midpoint": sig.midpoint,
                            "spread": sig.spread,
+                           "ev": sig.ev,
+                           "layer": sig.layer,
                            })
 
             push_state()
             update(engines={**_engines()})
 
-            time.sleep(config.SYNTH_SCAN_INTERVAL)
+            # ── Smart scan timing ──
+            delay = get_next_scan_delay()
+            time.sleep(delay)
 
         except Exception as e:
             log(f"Error: {e}", "synth")
             import traceback; traceback.print_exc()
-            time.sleep(30)
+            time.sleep(10)
 
 
 def _trade_dict(pos) -> dict:
@@ -253,29 +248,28 @@ def _engines():
 def main():
     print()
     print("▓" * 64)
-    print("▓  SIGNAL │ HARVEST + SYNTH                                  ▓")
+    print("▓  SIGNAL │ HARVEST + SYNTH  v2                              ▓")
     print("▓  Dual-Engine Compound Machine                              ▓")
     print("▓" * 64)
     print()
     mode = "PAPER" if config.PAPER_MODE else "!! LIVE !!"
     print(f"  Mode:       {mode}")
     print(f"  Bankroll:   ${config.STARTING_BANKROLL:.2f}")
+    print(f"  Kelly:      {config.KELLY_FRACTION}× (max {config.KELLY_MAX_BET_PCT:.0%}/trade)")
     print()
     print(f"  ENGINE 1 — HARVEST (ESPN Sports)")
     print(f"    Status:   {'ON' if config.HARVEST_ENABLED else 'OFF'}")
     print(f"    Sports:   {len(config.ESPN_SPORTS)}")
-    print(f"    Position: {config.HARVEST_POSITION_PCT:.0%} equity, ${config.HARVEST_MAX_USD:.0f} cap")
-    print(f"    Exposure: {config.HARVEST_MAX_EXPOSURE_PCT:.0%} max")
+    print(f"    CLOB:     {'Real prices' if config.HARVEST_USE_CLOB else 'Gamma only'}")
     print(f"    Interval: {config.HARVEST_SCAN_INTERVAL}s")
     print()
     synth_st = get_synth_status()
     print(f"  ENGINE 2 — SYNTH (Bittensor SN50)")
     print(f"    Status:   {'ON' if config.SYNTH_ENABLED else 'OFF'} │ {synth_st['message']}")
     print(f"    Assets:   {', '.join(config.SYNTH_ASSETS)}")
-    print(f"    Markets:  15min, hourly, daily")
-    print(f"    Exposure: {config.SYNTH_MAX_EXPOSURE_PCT:.0%} max")
-    print(f"    Interval: {config.SYNTH_SCAN_INTERVAL}s")
-    print(f"    CLOB:     Real orderbook prices enabled")
+    print(f"    Timing:   Smart (T-{config.SNIPE_LEAD_TIME}s wake, {config.SNIPE_SCAN_BURST}s burst)")
+    print(f"    Arb:      {'ON' if config.ARB_ENABLED else 'OFF'}")
+    print(f"    Resolve:  {config.CRYPTO_RESOLVE_BUFFER}s buffer")
     print()
     print("─" * 64)
 
@@ -284,7 +278,7 @@ def main():
     try:
         start_binance_feed()
     except Exception as e:
-        print(f"  [WARN] Binance feed failed to start: {e} — crypto snipe disabled")
+        print(f"  [WARN] Binance feed failed: {e}")
     push_state()
     update(engines=_engines())
 
@@ -295,29 +289,24 @@ def main():
         if confirm.strip() != "CONFIRM":
             sys.exit(0)
 
-    # Start both engines in separate threads
     threads = []
 
     if config.HARVEST_ENABLED:
         t1 = threading.Thread(target=harvest_loop, daemon=True, name="harvest")
         t1.start()
         threads.append(t1)
-        log("Harvest engine started", "harvest")
+        log("Harvest engine started (Kelly + CLOB)", "harvest")
 
     if config.SYNTH_ENABLED:
         t2 = threading.Thread(target=synth_loop, daemon=True, name="synth")
         t2.start()
         threads.append(t2)
-        if config.SYNTH_API_KEY:
-            log("Crypto engine started (snipe + Synth + CLOB prices)", "synth")
-        else:
-            log("Crypto engine started (snipe + CLOB prices — add SYNTH_API_KEY for Synth edge)", "synth")
+        log("Crypto engine started (EV + Kelly + smart timing + arb)", "synth")
 
     if not threads:
         log("No engines enabled!")
         sys.exit(1)
 
-    # Main thread just keeps alive and logs stats
     try:
         while True:
             time.sleep(60)
@@ -334,7 +323,6 @@ def main():
         print(f"  Equity:  ${stats['equity']:.2f}")
         print(f"  P&L:    ${stats['pnl']:+.2f} ({stats['roi']:+.1f}%)")
         print(f"  Trades: {stats['trades']} ({stats['win_rate']:.1%} win)")
-        print(f"  Harvest: {stats['harvest_trades']} │ Synth: {stats['synth_trades']}")
 
 
 if __name__ == "__main__":
