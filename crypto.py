@@ -17,6 +17,7 @@ Data sources:
   - Binance: wss://stream.binance.com:9443/ws/btcusdt@ticker (free, real-time)
   - Synth API: https://api.synthdata.co/insights/polymarket/* ($199/mo)
   - Polymarket Gamma: https://gamma-api.polymarket.com (free)
+  - Polymarket CLOB: https://clob.polymarket.com (free, read-only)
 
 Market timing:
   5-min:  slug = f"btc-updown-5m-{window_ts}"  (window_ts = now - now%300)
@@ -28,11 +29,15 @@ import time
 import json
 import math
 import threading
+import logging
 import requests
 from datetime import datetime, timezone
 from dataclasses import dataclass
 from typing import Optional
 import config
+from polymarket_prices import get_real_price
+
+logger = logging.getLogger("crypto")
 
 # ── Shared price state from Binance ──────────────
 _btc_price = {"price": 0.0, "time": 0.0}
@@ -138,7 +143,7 @@ class CryptoSignal:
     layer: str                    # "snipe", "synth", "arb"
     direction: str                # "up" or "down"
     # Pricing
-    price: float                  # What we'd pay
+    price: float                  # What we'd pay (REAL from CLOB when available)
     side: str                     # "YES" (up) or "NO" (down on up-market)
     shares: int
     cost: float
@@ -156,6 +161,12 @@ class CryptoSignal:
     # Meta
     detail: str                   # Human-readable explanation
     timestamp: str
+    # Real price data (new fields)
+    price_source: str = "estimate"    # "clob" or "estimate"
+    real_price: float = 0.0           # CLOB buy price (0 if unavailable)
+    midpoint: float = 0.0             # CLOB midpoint
+    spread: float = 0.0               # CLOB bid-ask spread
+    token_id: str = ""                # CLOB token ID
 
 
 def scan_crypto_opportunities(equity: float, open_crypto_exposure: float) -> list[CryptoSignal]:
@@ -209,6 +220,8 @@ def _check_5min_market(price_now: float, asset: str, now: float, equity: float, 
     LAYER 1: 5-minute latency snipe.
     ONLY trade when direction is CONFIRMED — high delta, late in window.
     The $438K bot's secret: at T-10s with 0.10%+ delta, outcome is locked.
+    
+    Now queries REAL Polymarket CLOB prices before trading.
     """
     window_ts = int(now) - (int(now) % 300)
     close_time = window_ts + 300
@@ -231,15 +244,56 @@ def _check_5min_market(price_now: float, asset: str, now: float, equity: float, 
 
     direction = "up" if delta_pct > 0 else "down"
 
-    # Price tiers — only trade at good prices
-    if abs_delta >= 0.15:
-        est_price = 0.92
-    elif abs_delta >= 0.10:
-        est_price = 0.85
-    elif abs_delta >= 0.05:
-        est_price = 0.72
+    # Build slug (crypto.py already computes window_ts)
+    slug_prefix = "btc" if asset == "BTC" else "eth" if asset == "ETH" else "sol"
+    slug = f"{slug_prefix}-updown-5m-{window_ts}"
+
+    # ── REAL POLYMARKET PRICE ──────────────────────────────────
+    real = get_real_price(slug, direction)
+
+    if real is not None:
+        buy_price = real["buy_price"]
+        midpoint_val = real["midpoint"]
+        spread_val = real["spread"]
+        token_id = real["token_id"]
+        price_source = "clob"
+
+        # Skip if spread too wide (illiquid market)
+        if spread_val > 0.10:
+            logger.info(f"[5m] {asset} spread too wide ({spread_val:.4f}), skipping")
+            return None
+
+        # Skip if price too high (no edge)
+        if buy_price >= 0.97:
+            logger.info(f"[5m] {asset} price too high ({buy_price:.4f}), skipping")
+            return None
+
+        # Skip if price too low (market disagrees with our signal)
+        if buy_price < 0.40:
+            logger.info(f"[5m] {asset} price too low ({buy_price:.4f}), market disagrees — skipping")
+            return None
+
+        est_price = buy_price
     else:
-        return None  # Should never reach here
+        # Fallback to estimated price if CLOB unavailable
+        logger.warning(f"[5m] CLOB unavailable for {slug}, using estimate")
+        midpoint_val = 0.0
+        spread_val = 0.0
+        token_id = ""
+        price_source = "estimate"
+
+        if abs_delta >= 0.15:
+            est_price = 0.92
+        elif abs_delta >= 0.10:
+            est_price = 0.85
+        elif abs_delta >= 0.05:
+            est_price = 0.72
+        else:
+            return None
+
+    # Min price gate
+    if est_price < 0.72:
+        return None
 
     implied_return = (1.0 - est_price) / est_price
 
@@ -257,9 +311,10 @@ def _check_5min_market(price_now: float, asset: str, now: float, equity: float, 
     else:
         confidence = 0.70
 
-    slug_prefix = "btc" if asset == "BTC" else "eth" if asset == "ETH" else "sol"
-    slug = f"{slug_prefix}-updown-5m-{window_ts}"
     now_dt = datetime.now(timezone.utc)
+
+    price_tag = f"${est_price:.2f}" if price_source == "estimate" else f"${est_price:.4f}"
+    source_tag = "EST" if price_source == "estimate" else "LIVE"
 
     return CryptoSignal(
         id=f"snipe-{asset}-5m-{window_ts}",
@@ -274,8 +329,14 @@ def _check_5min_market(price_now: float, asset: str, now: float, equity: float, 
         confidence=confidence,
         slug=slug, event_end=datetime.fromtimestamp(close_time, timezone.utc).isoformat(),
         seconds_remaining=int(seconds_left),
-        detail=f"SNIPE {asset} Δ{delta_pct:+.3f}% T-{int(seconds_left)}s → {direction.upper()} @ ~${est_price:.2f}",
+        detail=f"SNIPE {asset} Δ{delta_pct:+.3f}% T-{int(seconds_left)}s → {direction.upper()} @ {price_tag} [{source_tag}]",
         timestamp=now_dt.isoformat(),
+        # New real-price fields
+        price_source=price_source,
+        real_price=est_price if price_source == "clob" else 0.0,
+        midpoint=midpoint_val,
+        spread=spread_val,
+        token_id=token_id,
     )
 
 
@@ -284,6 +345,8 @@ def _check_15min_market(price_now: float, asset: str, now: float, equity: float,
     LAYER 1 for 15-minute markets.
     STRICTER than 5-min because more time for reversals.
     Only trade with 0.08%+ delta in last 30 seconds.
+    
+    Now queries REAL Polymarket CLOB prices before trading.
     """
     window_ts = int(now) - (int(now) % 900)
     close_time = window_ts + 900
@@ -306,13 +369,50 @@ def _check_15min_market(price_now: float, asset: str, now: float, equity: float,
 
     direction = "up" if delta_pct > 0 else "down"
 
-    if abs_delta >= 0.25:
-        est_price = 0.93
-    elif abs_delta >= 0.15:
-        est_price = 0.85
-    elif abs_delta >= 0.08:
-        est_price = 0.75
+    slug_prefix = "btc" if asset == "BTC" else "eth" if asset == "ETH" else "sol"
+    slug = f"{slug_prefix}-updown-15m-{window_ts}"
+
+    # ── REAL POLYMARKET PRICE ──────────────────────────────────
+    real = get_real_price(slug, direction)
+
+    if real is not None:
+        buy_price = real["buy_price"]
+        midpoint_val = real["midpoint"]
+        spread_val = real["spread"]
+        token_id = real["token_id"]
+        price_source = "clob"
+
+        if spread_val > 0.10:
+            logger.info(f"[15m] {asset} spread too wide ({spread_val:.4f}), skipping")
+            return None
+
+        if buy_price >= 0.97:
+            logger.info(f"[15m] {asset} price too high ({buy_price:.4f}), skipping")
+            return None
+
+        if buy_price < 0.40:
+            logger.info(f"[15m] {asset} price too low ({buy_price:.4f}), market disagrees — skipping")
+            return None
+
+        est_price = buy_price
     else:
+        logger.warning(f"[15m] CLOB unavailable for {slug}, using estimate")
+        midpoint_val = 0.0
+        spread_val = 0.0
+        token_id = ""
+        price_source = "estimate"
+
+        if abs_delta >= 0.25:
+            est_price = 0.93
+        elif abs_delta >= 0.15:
+            est_price = 0.85
+        elif abs_delta >= 0.08:
+            est_price = 0.75
+        else:
+            return None
+
+    # Min price gate
+    if est_price < 0.75:
         return None
 
     implied_return = (1.0 - est_price) / est_price
@@ -324,8 +424,8 @@ def _check_15min_market(price_now: float, asset: str, now: float, equity: float,
 
     confidence = min(0.75 + abs_delta * 1.5, 0.98)
 
-    slug_prefix = "btc" if asset == "BTC" else "eth" if asset == "ETH" else "sol"
-    slug = f"{slug_prefix}-updown-15m-{window_ts}"
+    price_tag = f"${est_price:.2f}" if price_source == "estimate" else f"${est_price:.4f}"
+    source_tag = "EST" if price_source == "estimate" else "LIVE"
 
     return CryptoSignal(
         id=f"snipe-{asset}-15m-{window_ts}",
@@ -340,8 +440,14 @@ def _check_15min_market(price_now: float, asset: str, now: float, equity: float,
         confidence=confidence,
         slug=slug, event_end=datetime.fromtimestamp(close_time, timezone.utc).isoformat(),
         seconds_remaining=int(seconds_left),
-        detail=f"SNIPE {asset} 15m Δ{delta_pct:+.3f}% T-{int(seconds_left)}s → {direction.upper()} @ ~${est_price:.2f}",
+        detail=f"SNIPE {asset} 15m Δ{delta_pct:+.3f}% T-{int(seconds_left)}s → {direction.upper()} @ {price_tag} [{source_tag}]",
         timestamp=datetime.now(timezone.utc).isoformat(),
+        # New real-price fields
+        price_source=price_source,
+        real_price=est_price if price_source == "clob" else 0.0,
+        midpoint=midpoint_val,
+        spread=spread_val,
+        token_id=token_id,
     )
 
 
@@ -422,6 +528,8 @@ def _check_synth_hourly(asset: str, equity: float, remaining: float) -> Optional
         seconds_remaining=0,
         detail=f"SYNTH {asset} 1h {direction.upper()} │ Synth:{synth_up:.1%} vs Poly:{poly_up:.1%} = {edge:+.1%} edge │ {confidence_label}",
         timestamp=datetime.now(timezone.utc).isoformat(),
+        # Synth uses Polymarket's reported price, not CLOB query
+        price_source="synth",
     )
 
 

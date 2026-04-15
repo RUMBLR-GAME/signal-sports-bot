@@ -175,6 +175,11 @@ def synth_loop():
                 "eventEnd": s.event_end, "currentPrice": 0,
                 "shares": s.shares, "cost": s.cost,
                 "timestamp": s.timestamp,
+                # New CLOB price fields
+                "priceSource": s.price_source,
+                "realPrice": s.real_price,
+                "midpoint": s.midpoint,
+                "spread": s.spread,
             } for s in signals])
 
             if signals:
@@ -193,7 +198,7 @@ def synth_loop():
                         signal_id=sig.id, engine="synth", sport=sig.asset,
                         event=f"{sig.asset} {sig.timeframe} {sig.direction}",
                         outcome=f"{sig.asset} {sig.direction.upper()}",
-                        side=sig.side, token_id="",
+                        side=sig.side, token_id=sig.token_id,
                         condition_id=sig.slug or sig.id,
                         entry_price=sig.price, shares=sig.shares,
                         confidence=sig.confidence,
@@ -202,7 +207,8 @@ def synth_loop():
                     )
                 traded += 1
                 edge_pct = round(sig.edge * 100, 1)
-                log(f"SNIPE {sig.asset} {sig.timeframe} {sig.direction.upper()} @ ${sig.price:.2f} │ Edge:{edge_pct:+.1f}% │ Delta:{sig.window_delta_pct:+.3f}%", "synth")
+                source_tag = "LIVE" if sig.price_source == "clob" else "EST"
+                log(f"SNIPE {sig.asset} {sig.timeframe} {sig.direction.upper()} @ ${sig.price:.4f} [{source_tag}] │ Edge:{edge_pct:+.1f}% │ Delta:{sig.window_delta_pct:+.3f}%", "synth")
                 add_trade({"id": sig.id, "engine": "synth", "sport": sig.asset,
                            "event": f"{sig.asset} {sig.timeframe}",
                            "outcome": f"{sig.direction.upper()}", "side": sig.side,
@@ -211,7 +217,13 @@ def synth_loop():
                            "edgePct": edge_pct, "confidence": sig.confidence,
                            "synthProb": sig.synth_prob_up, "polyProb": sig.poly_prob_up,
                            "timeframe": sig.timeframe, "status": "open",
-                           "pnl": None, "timestamp": now.isoformat()})
+                           "pnl": None, "timestamp": now.isoformat(),
+                           # New CLOB price fields for dashboard
+                           "priceSource": sig.price_source,
+                           "realPrice": sig.real_price,
+                           "midpoint": sig.midpoint,
+                           "spread": sig.spread,
+                           })
 
             push_state()
             update(engines={**_engines()})
@@ -263,6 +275,7 @@ def main():
     print(f"    Markets:  15min, hourly, daily")
     print(f"    Exposure: {config.SYNTH_MAX_EXPOSURE_PCT:.0%} max")
     print(f"    Interval: {config.SYNTH_SCAN_INTERVAL}s")
+    print(f"    CLOB:     Real orderbook prices enabled")
     print()
     print("─" * 64)
 
@@ -296,9 +309,9 @@ def main():
         t2.start()
         threads.append(t2)
         if config.SYNTH_API_KEY:
-            log("Crypto engine started (snipe + Synth)", "synth")
+            log("Crypto engine started (snipe + Synth + CLOB prices)", "synth")
         else:
-            log("Crypto engine started (snipe only — add SYNTH_API_KEY for Synth edge)", "synth")
+            log("Crypto engine started (snipe + CLOB prices — add SYNTH_API_KEY for Synth edge)", "synth")
 
     if not threads:
         log("No engines enabled!")

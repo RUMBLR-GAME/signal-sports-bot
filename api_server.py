@@ -37,6 +37,39 @@ def add_trade(t):
 def add_log(msg):
     with _lock: _state["log"] = [{"t": datetime.now(timezone.utc).isoformat(), "m": msg}] + _state["log"][:149]
 
+# ── CLOB status cache (checked lazily, not every request) ──
+_clob_status = {"status": "unknown", "checked": 0}
+_clob_lock = threading.Lock()
+
+def _check_clob_status() -> dict:
+    """Check CLOB connectivity. Cached for 30s."""
+    with _clob_lock:
+        if _clob_status["checked"] > 0 and (datetime.now(timezone.utc).timestamp() - _clob_status["checked"]) < 30:
+            return _clob_status
+    try:
+        from polymarket_prices import get_real_price
+        # Try fetching a real price — use current 5-min BTC window
+        import time as _time
+        now = int(_time.time())
+        window_ts = now - (now % 300)
+        slug = f"btc-updown-5m-{window_ts}"
+        result = get_real_price(slug, "up")
+        status = {
+            "status": "ok" if result else "no_market",
+            "checked": datetime.now(timezone.utc).timestamp(),
+            "sample": result,
+        }
+    except Exception as e:
+        status = {
+            "status": "error",
+            "checked": datetime.now(timezone.utc).timestamp(),
+            "error": str(e)[:100],
+        }
+    with _clob_lock:
+        _clob_status.update(status)
+    return status
+
+
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path in ("/api/state", "/"):
@@ -47,6 +80,19 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+        elif self.path == "/api/clob-status":
+            status = _check_clob_status()
+            # Strip the sample's token_id for security (it's long and not needed by dashboard)
+            safe = {
+                "status": status.get("status", "unknown"),
+                "checked": status.get("checked", 0),
+            }
+            if status.get("sample"):
+                safe["buy_price"] = status["sample"].get("buy_price")
+                safe["spread"] = status["sample"].get("spread")
+            if status.get("error"):
+                safe["error"] = status["error"]
+            self._j(200, safe)
         elif self.path == "/health":
             self._j(200, {"status": "ok"})
         else:
