@@ -1,22 +1,13 @@
 """
 clob.py — Polymarket CLOB Interface
-All orderbook interactions: prices, orders, fills, balance, resolution.
-
-CRITICAL GOTCHAS HANDLED:
-1. get_price() returns dict {"price": "0.85"}, NOT float
-2. Uses create_order + post_order separately (NOT create_and_post_order)
-3. post_only=True on every order
-4. NEVER calls update_balance_allowance()
-5. 500ms delay after fill before reading balance
-6. Rate limited to 55 orders/min
-7. get_tick_size() before every order
+Prices, orders, fills, balance, resolution, market discovery.
+All CLOB gotchas handled (see v3 handoff for full list).
 """
 
 import json
 import logging
 import time
 from typing import Optional
-
 import aiohttp
 
 from config import (
@@ -30,106 +21,74 @@ logger = logging.getLogger("clob")
 
 
 class ClobInterface:
-    """Wraps py-clob-client with safe defaults and error handling."""
-
     def __init__(self):
         self._client = None
         self._authenticated = False
         self._order_timestamps: list[float] = []
         self._initialized = False
-        self._http_session: Optional[aiohttp.ClientSession] = None
+        self._session: Optional[aiohttp.ClientSession] = None
 
     def initialize(self) -> bool:
-        """Initialize the CLOB client. Call once at startup."""
         try:
             from py_clob_client.client import ClobClient
-
             if PAPER_MODE or not POLYMARKET_PRIVATE_KEY:
                 self._client = ClobClient(CLOB_HOST)
                 self._authenticated = False
-                logger.info("CLOB client initialized (read-only / paper mode)")
+                logger.info("CLOB: read-only (paper mode)")
             else:
                 self._client = ClobClient(
-                    host=CLOB_HOST,
-                    chain_id=CHAIN_ID,
+                    host=CLOB_HOST, chain_id=CHAIN_ID,
                     key=POLYMARKET_PRIVATE_KEY,
                     signature_type=SIGNATURE_TYPE,
                     funder=POLYMARKET_FUNDER_ADDRESS,
                 )
                 self._client.set_api_creds(self._client.create_or_derive_api_creds())
                 self._authenticated = True
-                logger.info("CLOB client initialized (authenticated)")
-
+                logger.info("CLOB: authenticated")
             self._initialized = True
             return True
-
         except Exception as e:
-            logger.error(f"CLOB initialization failed: {e}")
+            logger.error(f"CLOB init failed: {e}")
             return False
 
-    def is_ready(self) -> bool:
-        return self._initialized and self._client is not None
+    def is_ready(self): return self._initialized
+    def is_authenticated(self): return self._authenticated
 
-    def is_authenticated(self) -> bool:
-        return self._authenticated
-
-    async def _get_session(self) -> aiohttp.ClientSession:
-        """Get or create a reusable HTTP session for Gamma API calls."""
-        if self._http_session is None or self._http_session.closed:
-            self._http_session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=15)
-            )
-        return self._http_session
+    async def _get_session(self):
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15))
+        return self._session
 
     async def close(self):
-        """Close the HTTP session. Call on shutdown."""
-        if self._http_session and not self._http_session.closed:
-            await self._http_session.close()
+        if self._session and not self._session.closed:
+            await self._session.close()
 
-    # ─── PRICE QUERIES ───────────────────────────────────────────────────
+    # ─── PRICES ──────────────────────────────────────────────────────────
 
     def get_price(self, token_id: str, side: str = "BUY") -> Optional[float]:
-        """Get current price. CRITICAL: API returns dict, not float."""
         try:
             resp = self._client.get_price(token_id, side)
             return float(resp["price"])
         except Exception as e:
-            logger.error(f"get_price failed for {token_id[:20]}: {e}")
+            logger.error(f"get_price failed: {e}")
             return None
 
     def get_midpoint(self, token_id: str) -> Optional[float]:
         try:
-            resp = self._client.get_midpoint(token_id)
-            return float(resp["mid"])
-        except Exception as e:
-            logger.error(f"get_midpoint failed: {e}")
+            return float(self._client.get_midpoint(token_id)["mid"])
+        except Exception:
             return None
 
-    def get_spread(self, token_id: str) -> Optional[float]:
-        try:
-            resp = self._client.get_spread(token_id)
-            return float(resp["spread"])
-        except Exception as e:
-            logger.error(f"get_spread failed: {e}")
-            return None
-
-    # ─── ORDER MANAGEMENT ────────────────────────────────────────────────
+    # ─── ORDERS ──────────────────────────────────────────────────────────
 
     def _check_rate_limit(self) -> bool:
         now = time.time()
         self._order_timestamps = [t for t in self._order_timestamps if now - t < 60]
-        if len(self._order_timestamps) >= MAX_ORDERS_PER_MINUTE:
-            logger.warning(f"Rate limit: {len(self._order_timestamps)} orders in last 60s")
-            return False
-        return True
+        return len(self._order_timestamps) < MAX_ORDERS_PER_MINUTE
 
     def place_order(self, token_id: str, price: float, size: float, side: str = "BUY") -> Optional[dict]:
-        """
-        Place a maker limit order with post_only=True.
-        Uses create_order + post_order separately.
-        """
         if not self._authenticated:
-            logger.info(f"[PAPER] Would place {side} {size:.1f}@{price:.3f} on {token_id[:16]}...")
+            logger.info(f"[PAPER] {side} {size:.1f}@{price:.3f}")
             return {"orderID": f"paper-{int(time.time()*1000)}", "paper": True}
 
         if not self._check_rate_limit():
@@ -141,175 +100,147 @@ class ClobInterface:
 
             tick_size = self._client.get_tick_size(token_id)
             options = PartialCreateOrderOptions(tick_size=tick_size)
-            order_side = BUY if side == "BUY" else SELL
-            order_args = OrderArgs(token_id=token_id, price=price, size=size, side=order_side)
-
+            order_args = OrderArgs(
+                token_id=token_id, price=price, size=size,
+                side=BUY if side == "BUY" else SELL,
+            )
             signed = self._client.create_order(order_args, options)
             result = self._client.post_order(signed, OrderType.GTC, post_only=True)
-
             self._order_timestamps.append(time.time())
-            logger.info(f"Order placed: {side} {size}@{price} → {result.get('orderID', '?')}")
+            logger.info(f"Order: {side} {size}@{price} → {result.get('orderID','?')}")
             return result
-
         except Exception as e:
-            logger.error(f"Order placement failed: {e}")
+            logger.error(f"Order failed: {e}")
             return None
 
     def cancel_order(self, order_id: str) -> bool:
         if not self._authenticated:
-            logger.info(f"[PAPER] Would cancel order {order_id}")
             return True
         try:
             self._client.cancel(order_id)
-            logger.info(f"Cancelled order {order_id}")
             return True
         except Exception as e:
-            logger.error(f"Cancel failed for {order_id}: {e}")
+            logger.error(f"Cancel failed: {e}")
             return False
 
     def get_open_orders(self) -> list[dict]:
-        """Poll open orders (fill notifications can be lost on connection drops)."""
         if not self._authenticated:
             return []
         try:
             orders = self._client.get_orders()
             return orders if isinstance(orders, list) else []
-        except Exception as e:
-            logger.error(f"get_orders failed: {e}")
+        except Exception:
             return []
 
-    # ─── BALANCE ─────────────────────────────────────────────────────────
-
     def get_balance(self) -> Optional[float]:
-        """Read USDC balance. NEVER calls update_balance_allowance()."""
         if not self._authenticated:
             return None
         try:
             bal = self._client.get_balance_allowance()
             return float(bal.get("balance", 0)) if isinstance(bal, dict) else None
-        except Exception as e:
-            logger.error(f"get_balance failed: {e}")
+        except Exception:
             return None
 
     # ─── MARKET DISCOVERY ────────────────────────────────────────────────
 
     async def fetch_polymarket_events(self, sport: str) -> list[dict]:
-        """Fetch active Polymarket events for a sport. Filters out futures/props."""
         tag = SPORT_TAG_SLUGS.get(sport)
         if not tag:
             return []
-
-        url = f"{GAMMA_API}/events"
-        params = {"active": "true", "tag_slug": tag, "limit": 50}
-
         try:
             session = await self._get_session()
-            async with session.get(url, params=params) as resp:
+            async with session.get(f"{GAMMA_API}/events", params={"active": "true", "tag_slug": tag, "limit": 50}) as resp:
                 if resp.status != 200:
-                    logger.warning(f"Gamma API {sport} returned {resp.status}")
                     return []
                 data = await resp.json()
         except Exception as e:
-            logger.error(f"Gamma API fetch failed for {sport}: {e}")
+            logger.error(f"Gamma API {sport}: {e}")
             return []
 
-        events = []
-        for event in data if isinstance(data, list) else []:
-            try:
-                title = event.get("title", "").lower()
-                if any(word in title for word in FUTURES_BLOCK):
-                    continue
-                events.append(event)
-            except Exception:
-                continue
+        return [
+            ev for ev in (data if isinstance(data, list) else [])
+            if not any(w in ev.get("title", "").lower() for w in FUTURES_BLOCK)
+        ]
 
-        return events
-
-    async def check_resolution(self, condition_id: str) -> Optional[dict]:
-        """Check if a market has resolved via Gamma API."""
-        url = f"{GAMMA_API}/markets"
-        params = {"conditionId": condition_id}
-
+    async def fetch_all_active_markets(self) -> list[dict]:
+        """Fetch ALL active Polymarket markets (for Poly Arber). No sport filter."""
+        all_markets = []
         try:
             session = await self._get_session()
-            async with session.get(url, params=params) as resp:
+            for tag in SPORT_TAG_SLUGS.values():
+                try:
+                    async with session.get(f"{GAMMA_API}/events", params={"active": "true", "tag_slug": tag, "limit": 50}) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            if isinstance(data, list):
+                                all_markets.extend(data)
+                except Exception:
+                    continue
+        except Exception as e:
+            logger.error(f"fetch_all_active_markets: {e}")
+
+        return all_markets
+
+    async def check_resolution(self, condition_id: str) -> Optional[dict]:
+        try:
+            session = await self._get_session()
+            async with session.get(f"{GAMMA_API}/markets", params={"conditionId": condition_id}) as resp:
                 if resp.status != 200:
                     return None
                 data = await resp.json()
         except Exception as e:
-            logger.error(f"Resolution check failed for {condition_id}: {e}")
+            logger.error(f"Resolution check: {e}")
             return None
 
-        market = None
-        if isinstance(data, list) and len(data) > 0:
-            market = data[0]
-        elif isinstance(data, dict):
-            market = data
-
+        market = data[0] if isinstance(data, list) and data else data if isinstance(data, dict) else None
         if not market:
             return None
 
-        if not (market.get("closed", False) or market.get("resolved", False)):
+        if not (market.get("closed") or market.get("resolved")):
             return {"resolved": False}
 
         try:
-            prices_str = market.get("outcomePrices", "[]")
-            prices = json.loads(prices_str) if isinstance(prices_str, str) else prices_str
-            yes_price = float(prices[0]) if len(prices) > 0 else 0.0
-            no_price = float(prices[1]) if len(prices) > 1 else 0.0
+            prices = market.get("outcomePrices", "[]")
+            prices = json.loads(prices) if isinstance(prices, str) else prices
+            yp = float(prices[0]) if len(prices) > 0 else 0.0
         except Exception:
-            yes_price = 0.0
-            no_price = 0.0
+            yp = 0.0
 
-        winner = "UNKNOWN"
-        if yes_price >= 0.99:
-            winner = "YES"
-        elif yes_price <= 0.01:
-            winner = "NO"
-
-        return {"resolved": True, "winner": winner, "yes_price": yes_price, "no_price": no_price}
+        winner = "YES" if yp >= 0.99 else "NO" if yp <= 0.01 else "UNKNOWN"
+        return {"resolved": True, "winner": winner, "yes_price": yp}
 
 
 def parse_market_tokens(market: dict) -> Optional[dict]:
-    """
-    Parse a Gamma API market dict to extract token IDs, outcomes, and prices.
-    Returns dict with condition_id, question, outcomes, token_ids, prices, end_date
-    or None if parsing fails.
-    """
+    """Parse Gamma API event → token IDs, outcomes, prices."""
     try:
         markets = market.get("markets", [])
         if not markets:
             return None
-
         m = markets[0]
-        condition_id = m.get("conditionId", "")
-        question = m.get("question", market.get("title", ""))
+        if m.get("closed"):
+            return None
 
-        outcomes_str = m.get("outcomes", "[]")
-        outcomes = json.loads(outcomes_str) if isinstance(outcomes_str, str) else outcomes_str
-
-        tokens_str = m.get("clobTokenIds", "[]")
-        tokens = json.loads(tokens_str) if isinstance(tokens_str, str) else tokens_str
-
-        prices_str = m.get("outcomePrices", "[]")
-        prices = json.loads(prices_str) if isinstance(prices_str, str) else prices_str
+        outcomes = m.get("outcomes", "[]")
+        outcomes = json.loads(outcomes) if isinstance(outcomes, str) else outcomes
+        tokens = m.get("clobTokenIds", "[]")
+        tokens = json.loads(tokens) if isinstance(tokens, str) else tokens
+        prices = m.get("outcomePrices", "[]")
+        prices = json.loads(prices) if isinstance(prices, str) else prices
         prices = [float(p) for p in prices]
 
         if len(outcomes) < 2 or len(tokens) < 2:
             return None
 
-        if m.get("closed", False):
-            return None
-
         return {
-            "condition_id": condition_id,
-            "question": question,
+            "condition_id": m.get("conditionId", ""),
+            "question": m.get("question", market.get("title", "")),
             "outcomes": outcomes,
             "token_ids": tokens,
             "prices": prices,
-            "end_date": m.get("endDate", market.get("endDate", "")),
+            "end_date": m.get("endDate", ""),
+            "volume": float(market.get("volume", 0) or 0),
+            "liquidity": float(market.get("liquidity", 0) or 0),
         }
-
     except Exception as e:
-        logger.error(f"Failed to parse market tokens: {e}")
+        logger.error(f"parse_market_tokens: {e}")
         return None
