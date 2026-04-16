@@ -165,7 +165,7 @@ class ClobInterface:
                 "order": "startTime",
                 "ascending": "true",
             }
-            async with session.get(f"{GAMMA_API}/events", params=params) as resp:
+            async with session.get(f"{GAMMA_API}/events", params=params, timeout=5) as resp:
                 if resp.status != 200:
                     logger.warning(f"Gamma API {sport} (series {series_id}): HTTP {resp.status}")
                     return []
@@ -189,27 +189,38 @@ class ClobInterface:
         return filtered
 
     async def fetch_all_active_markets(self) -> list[dict]:
-        """Fetch current game markets across all leagues (for Poly Arber)."""
-        all_markets = []
+        """Fetch current game markets across all leagues (for Poly Arber). Parallel with timeout."""
+        import asyncio
+        session = await self._get_session()
+
+        async def fetch_series(series_id):
+            try:
+                params = {
+                    "series_id": series_id,
+                    "tag_id": POLY_GAMES_TAG_ID,
+                    "active": "true", "closed": "false", "archived": "false",
+                    "limit": 30, "order": "startTime", "ascending": "true",
+                }
+                async with session.get(f"{GAMMA_API}/events", params=params, timeout=5) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        return data if isinstance(data, list) else []
+            except Exception:
+                pass
+            return []
+
         try:
-            session = await self._get_session()
-            for series_id in POLY_SERIES_IDS.values():
-                try:
-                    params = {
-                        "series_id": series_id,
-                        "tag_id": POLY_GAMES_TAG_ID,
-                        "active": "true", "closed": "false", "archived": "false",
-                        "limit": 50, "order": "startTime", "ascending": "true",
-                    }
-                    async with session.get(f"{GAMMA_API}/events", params=params) as resp:
-                        if resp.status == 200:
-                            data = await resp.json()
-                            if isinstance(data, list):
-                                all_markets.extend(data)
-                except Exception:
-                    continue
+            results = await asyncio.wait_for(
+                asyncio.gather(*[fetch_series(sid) for sid in POLY_SERIES_IDS.values()], return_exceptions=True),
+                timeout=15,
+            )
+            all_markets = []
+            for r in results:
+                if isinstance(r, list):
+                    all_markets.extend(r)
         except Exception as e:
             logger.error(f"fetch_all_active_markets: {e}")
+            return []
 
         return [
             ev for ev in all_markets
