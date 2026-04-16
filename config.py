@@ -92,8 +92,9 @@ EDGE_PRE_GAME_EXIT_MIN = int(os.getenv("EDGE_PRE_GAME_EXIT_MIN", "30")) # exit 3
 EDGE_STALE_HOURS = float(os.getenv("EDGE_STALE_HOURS", "48"))           # exit if held >48h
 
 # ─── POLY ARBER ENGINE ──────────────────────────────────────────────────────
-ARBER_MIN_PROFIT = float(os.getenv("ARBER_MIN_PROFIT", "0.03"))
+ARBER_MIN_PROFIT = float(os.getenv("ARBER_MIN_PROFIT", "0.05"))      # raised from 3% to 5%
 ARBER_MAX_OUTCOMES = int(os.getenv("ARBER_MAX_OUTCOMES", "10"))
+ARBER_MIN_BET = float(os.getenv("ARBER_MIN_BET", "20"))               # minimum $20 per arb
 
 # ─── ESPN SPORTS ─────────────────────────────────────────────────────────────
 # 30+ leagues. Obscure soccer leagues are where pricing inefficiency is largest.

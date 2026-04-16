@@ -19,7 +19,7 @@ from typing import Optional
 from clob import ClobInterface, parse_market_tokens
 from positions import PositionManager
 from sizing import compute_bet_size
-from config import ARBER_MIN_PROFIT, ARBER_MAX_OUTCOMES, MIN_MARKET_LIQUIDITY
+from config import ARBER_MIN_PROFIT, ARBER_MAX_OUTCOMES, MIN_MARKET_LIQUIDITY, ARBER_MIN_BET
 
 logger = logging.getLogger("arber")
 
@@ -171,7 +171,7 @@ async def scan_arber(clob: ClobInterface, positions: PositionManager) -> list[Ar
                     if arb:
                         # Size: how many share-sets can we buy?
                         available = compute_bet_size("arber", arb.total_cost, 0.99, positions.equity, positions)
-                        if available > 0:
+                        if available >= ARBER_MIN_BET:
                             arb.bet_size = available
                             arb.sport = event.get("tag", "")
                             signals.append(arb)
@@ -181,7 +181,7 @@ async def scan_arber(clob: ClobInterface, positions: PositionManager) -> list[Ar
                 arb = _check_multi_outcome_arb(event, clob)
                 if arb:
                     available = compute_bet_size("arber", arb.total_cost, 0.99, positions.equity, positions)
-                    if available > 0:
+                    if available >= ARBER_MIN_BET:
                         arb.bet_size = available
                         arb.sport = event.get("tag", "")
                         signals.append(arb)
