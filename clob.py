@@ -149,7 +149,16 @@ class ClobInterface:
             return []
         try:
             session = await self._get_session()
-            async with session.get(f"{GAMMA_API}/events", params={"active": "true", "tag_slug": tag, "limit": 50}) as resp:
+            params = {
+                "active": "true",
+                "closed": "false",
+                "archived": "false",
+                "tag_slug": tag,
+                "limit": 100,
+                "order": "endDate",
+                "ascending": "true",  # soonest-ending first = current games
+            }
+            async with session.get(f"{GAMMA_API}/events", params=params) as resp:
                 if resp.status != 200:
                     logger.warning(f"Gamma API {sport} ({tag}): HTTP {resp.status}")
                     return []
@@ -163,12 +172,11 @@ class ClobInterface:
             ev for ev in raw
             if not any(w in ev.get("title", "").lower() for w in FUTURES_BLOCK)
         ]
-        # Store diagnostic info
         if not hasattr(self, "_poly_diag"):
             self._poly_diag = {}
         self._poly_diag[sport] = {
             "tag": tag, "raw": len(raw), "filtered": len(filtered),
-            "sample_titles": [ev.get("title","") for ev in raw[:5]],
+            "sample_titles": [ev.get("title","") for ev in filtered[:5]],
         }
         return filtered
 
