@@ -280,9 +280,11 @@ async def main():
             bot_state["scan_log"] = bot_state["scan_log"][-50:]
 
     bot_state["log_event"] = log_event
+    bot_state["clob"] = None  # set after init
     clob = ClobInterface()
     if not clob.initialize():
         logger.error("CLOB init failed — degraded mode")
+    bot_state["clob"] = clob
     positions = PositionManager()
     await positions.initialize()
     app = create_api(positions, bot_state)

@@ -151,16 +151,26 @@ class ClobInterface:
             session = await self._get_session()
             async with session.get(f"{GAMMA_API}/events", params={"active": "true", "tag_slug": tag, "limit": 50}) as resp:
                 if resp.status != 200:
+                    logger.warning(f"Gamma API {sport} ({tag}): HTTP {resp.status}")
                     return []
                 data = await resp.json()
         except Exception as e:
             logger.error(f"Gamma API {sport}: {e}")
             return []
 
-        return [
-            ev for ev in (data if isinstance(data, list) else [])
+        raw = data if isinstance(data, list) else []
+        filtered = [
+            ev for ev in raw
             if not any(w in ev.get("title", "").lower() for w in FUTURES_BLOCK)
         ]
+        # Store diagnostic info
+        if not hasattr(self, "_poly_diag"):
+            self._poly_diag = {}
+        self._poly_diag[sport] = {
+            "tag": tag, "raw": len(raw), "filtered": len(filtered),
+            "sample_titles": [ev.get("title","") for ev in raw[:5]],
+        }
+        return filtered
 
     async def fetch_all_active_markets(self) -> list[dict]:
         """Fetch ALL active Polymarket markets (for Poly Arber). Filtered for game markets only."""
