@@ -223,8 +223,9 @@ async def bot_loop(clob, positions, bot_state):
                 except Exception as e:
                     logger.error(f"Edge exit: {e}", exc_info=True)
 
-            # ARBER — every 3 min
-            if now - last["arber"] >= ARBER_INTERVAL:
+            # ARBER — every 3 min (can be disabled via ARBER_ENABLED=false)
+            from config import ARBER_ENABLED
+            if ARBER_ENABLED and now - last["arber"] >= ARBER_INTERVAL:
                 last["arber"] = now
                 bot_state["last_arber_scan"] = now
                 try:
