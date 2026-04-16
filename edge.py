@@ -83,15 +83,18 @@ def _minutes_until_game(commence_time: str) -> Optional[float]:
     return hours * 60 if hours is not None else None
 
 
-async def scan_edge(clob: ClobInterface, positions: PositionManager) -> list[EdgeSignal]:
+async def scan_edge(clob: ClobInterface, positions: PositionManager) -> tuple[list[EdgeSignal], list[dict]]:
     """
     Scan for convergence trade opportunities.
-    Only enters when game is 2-48 hours away.
+    Returns (tradeable_signals, all_edges_for_dashboard).
+    all_edges includes near-misses below threshold for the scanner view.
     """
     signals = []
+    all_edges = []  # For dashboard — includes sub-threshold edges
+    
     all_odds = await fetch_pregame_odds()
     if not all_odds:
-        return []
+        return [], []
 
     # Group by sport, deduplicate by game (prefer ESPN BET > FanDuel)
     by_sport: dict[str, list[GameOdds]] = {}
@@ -151,6 +154,16 @@ async def scan_edge(clob: ClobInterface, positions: PositionManager) -> list[Edg
                         continue
 
                     edge = prob - poly_price
+                    
+                    # Record ALL edges >= 1% for dashboard scanner (even if below trade threshold)
+                    if edge >= 0.01:
+                        all_edges.append({
+                            "team": team, "sport": sport, "poly": poly_price,
+                            "true": prob, "edge": edge, "provider": odds.provider,
+                            "hours": round(hours, 1),
+                        })
+
+                    # Only trade if above minimum edge threshold
                     if edge < EDGE_MIN_EDGE:
                         continue
 
@@ -170,13 +183,16 @@ async def scan_edge(clob: ClobInterface, positions: PositionManager) -> list[Edg
                     ))
                 break  # one poly match per ESPN game
 
+    # Sort all_edges by edge size descending
+    all_edges.sort(key=lambda e: e["edge"], reverse=True)
+
     for s in signals:
         h = _hours_until_game(s.commence_time)
         logger.info(
             f"⚡ EDGE: {s.team} @{s.clob_price:.3f} true={s.true_prob:.3f} "
             f"edge={s.edge:.3f} [{s.provider}] ${s.bet_size} | game in {h:.1f}h"
         )
-    return signals
+    return signals, all_edges[:20]
 
 
 async def check_edge_exits(clob: ClobInterface, positions: PositionManager):

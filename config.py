@@ -238,7 +238,11 @@ FUTURES_BLOCK = {
     "conference", "prop", "total points", "over/under", "spread",
     "most", "season", "award", "draft", "futures",
     "rookie", "all-star", "leader", "scoring", "outright",
-    "relegation", "golden boot", "ballon", "transfer",
+    "relegation", "relegated", "golden boot", "ballon", "transfer",
+    "finish", "place", "top 4", "top 6", "top half", "bottom",
+    "promoted", "promotion", "survive", "survival",
+    "which club", "which team", "who will", "make playoffs",
+    "win total", "over under", "regular season",
 }
 
 # ─── DASHBOARD ───────────────────────────────────────────────────────────────

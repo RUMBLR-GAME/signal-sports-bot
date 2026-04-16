@@ -10,6 +10,7 @@ from config import (
     PAPER_MODE, API_PORT, STARTING_BANKROLL,
     HARVEST_INTERVAL, EDGE_SCAN_INTERVAL, EDGE_EXIT_INTERVAL,
     ARBER_INTERVAL, RESOLVE_INTERVAL, MAX_UNFILLED_AGE, FILL_CHECK_DELAY_MS,
+    EDGE_MIN_EDGE,
 )
 from clob import ClobInterface
 from positions import PositionManager, Position
@@ -144,17 +145,15 @@ async def bot_loop(clob, positions, bot_state):
                 last["edge_scan"] = now
                 bot_state["last_edge_scan"] = now
                 try:
-                    edge_signals = await scan_edge(clob, positions)
-                    # Store ALL edges found for scanner view (not just traded)
+                    edge_signals, all_edges = await scan_edge(clob, positions)
+                    # Store ALL edges for dashboard scanner (including sub-threshold)
+                    bot_state["edges_found"] = all_edges
                     if edge_signals:
-                        bot_state["edges_found"] = [{
-                            "team": s.team, "sport": s.sport, "poly": s.clob_price,
-                            "true": s.true_prob, "edge": s.edge, "provider": s.provider,
-                            "bet": s.bet_size, "t": now,
-                        } for s in edge_signals][:20]
-                        log(f"⚡ {len(edge_signals)} edges found", level="signal", engine="edge")
+                        log(f"⚡ {len(edge_signals)} tradeable edges (of {len(all_edges)} detected)", level="signal", engine="edge")
+                    elif all_edges:
+                        log(f"Scanned — {len(all_edges)} edges found, none above {int(EDGE_MIN_EDGE*100)}% threshold", engine="edge")
                     else:
-                        log(f"Scanned odds — no edges above 5%", engine="edge")
+                        log(f"Scanned odds — no edges detected", engine="edge")
                     for s in edge_signals:
                         await execute_signal(s, clob, positions)
                         log(f"⚡ BUY {s.team} @{s.clob_price:.2f} (true {s.true_prob:.2f}, edge {s.edge:.1%})", level="trade", engine="edge")

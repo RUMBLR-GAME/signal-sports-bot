@@ -163,7 +163,7 @@ class ClobInterface:
         ]
 
     async def fetch_all_active_markets(self) -> list[dict]:
-        """Fetch ALL active Polymarket markets (for Poly Arber). No sport filter."""
+        """Fetch ALL active Polymarket markets (for Poly Arber). Filtered for game markets only."""
         all_markets = []
         try:
             session = await self._get_session()
@@ -179,7 +179,11 @@ class ClobInterface:
         except Exception as e:
             logger.error(f"fetch_all_active_markets: {e}")
 
-        return all_markets
+        # Filter out futures/season-long markets — arber should only trade game markets
+        return [
+            ev for ev in all_markets
+            if not any(w in ev.get("title", "").lower() for w in FUTURES_BLOCK)
+        ]
 
     async def check_resolution(self, condition_id: str) -> Optional[dict]:
         try:
