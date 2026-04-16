@@ -131,6 +131,54 @@ async def bot_loop(clob, positions, bot_state):
                 bot_state.update(last_harvest_scan=now, scan_count=scans)
                 try:
                     signals, live_games, blowout_log = await scan_harvest(clob, positions)
+
+                    # Enrich live games with Polymarket odds (home_price, away_price, home_prob, away_prob)
+                    from clob import parse_market_tokens
+                    from teams import find_team_in_outcomes
+                    sport_cache = {}
+                    for g in live_games:
+                        sport = g.get("sport")
+                        if not sport:
+                            continue
+                        if sport not in sport_cache:
+                            try:
+                                sport_cache[sport] = await clob.fetch_polymarket_events(sport)
+                            except Exception:
+                                sport_cache[sport] = []
+
+                        # Find matching Polymarket market
+                        for ev in sport_cache[sport]:
+                            parsed = parse_market_tokens(ev)
+                            if not parsed:
+                                continue
+                            outcomes = parsed["outcomes"]
+                            hi = find_team_in_outcomes(g["home_team"], g["home_abbrev"], outcomes)
+                            ai = find_team_in_outcomes(g["away_team"], g["away_abbrev"], outcomes)
+                            if hi < 0 or ai < 0 or hi == ai:
+                                continue
+                            # Got a match — fetch real-time prices
+                            try:
+                                hp = clob.get_price(parsed["token_ids"][hi], "BUY")
+                                ap = clob.get_price(parsed["token_ids"][ai], "BUY")
+                                if hp is not None:
+                                    g["home_poly"] = round(hp, 3)
+                                if ap is not None:
+                                    g["away_poly"] = round(ap, 3)
+                                g["market"] = parsed["question"][:60]
+                            except Exception:
+                                pass
+                            # Also attach blowout true_prob if available
+                            bl = next((b for b in blowout_log if b.get("leader") in (g["home_abbrev"], g["away_abbrev"])), None)
+                            if bl:
+                                leader_ab = bl["leader"]
+                                if leader_ab == g["home_abbrev"]:
+                                    g["home_true_prob"] = round(bl["confidence"], 3)
+                                    g["away_true_prob"] = round(1 - bl["confidence"], 3)
+                                elif leader_ab == g["away_abbrev"]:
+                                    g["away_true_prob"] = round(bl["confidence"], 3)
+                                    g["home_true_prob"] = round(1 - bl["confidence"], 3)
+                            break
+
                     bot_state["live_games"] = live_games
                     bot_state["blowout_log"] = blowout_log
                     if live_games:
