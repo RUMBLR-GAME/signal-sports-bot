@@ -143,27 +143,28 @@ async def scan_edge(clob: ClobInterface, positions: PositionManager) -> tuple[li
                 if hi < 0 or ai < 0 or hi == ai:
                     continue
 
-                # Check both sides
+                # Check both sides - record every scan
                 for team, prob, ml, idx in [
                     (odds.home_team, odds.home_prob, odds.home_ml, hi),
                     (odds.away_team, odds.away_prob, odds.away_ml, ai),
                 ]:
                     tid = parsed["token_ids"][idx]
                     poly_price = clob.get_price(tid, "BUY")
-                    if poly_price is None or poly_price > EDGE_MAX_PRICE or poly_price < EDGE_MIN_PRICE:
+                    if poly_price is None:
                         continue
 
                     edge = prob - poly_price
                     
-                    # Record ALL edges >= 1% for dashboard scanner (even if below trade threshold)
-                    if edge >= 0.01:
-                        all_edges.append({
-                            "team": team, "sport": sport, "poly": poly_price,
-                            "true": prob, "edge": edge, "provider": odds.provider,
-                            "hours": round(hours, 1),
-                        })
+                    # Record EVERY game scanned (even negative edge) for dashboard visibility
+                    all_edges.append({
+                        "team": team, "sport": sport, "poly": poly_price,
+                        "true": prob, "edge": edge, "provider": odds.provider,
+                        "hours": round(hours, 1),
+                    })
 
-                    # Only trade if above minimum edge threshold
+                    # Trading filters — price range + minimum edge
+                    if poly_price > EDGE_MAX_PRICE or poly_price < EDGE_MIN_PRICE:
+                        continue
                     if edge < EDGE_MIN_EDGE:
                         continue
 
@@ -192,7 +193,7 @@ async def scan_edge(clob: ClobInterface, positions: PositionManager) -> tuple[li
             f"⚡ EDGE: {s.team} @{s.clob_price:.3f} true={s.true_prob:.3f} "
             f"edge={s.edge:.3f} [{s.provider}] ${s.bet_size} | game in {h:.1f}h"
         )
-    return signals, all_edges[:20]
+    return signals, all_edges[:200]
 
 
 async def check_edge_exits(clob: ClobInterface, positions: PositionManager):

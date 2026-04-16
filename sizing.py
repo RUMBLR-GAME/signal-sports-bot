@@ -78,10 +78,10 @@ def compute_bet_size(
             return 0.0
         size = min(size, available)
 
-    # Total exposure limit
+    # Total exposure limit — hard cap at STARTING_BANKROLL
+    from config import STARTING_BANKROLL
     total_open = positions.open_cost
-    total_equity = equity + total_open
-    max_open = total_equity * MAX_TOTAL_EXPOSURE
+    max_open = STARTING_BANKROLL * MAX_TOTAL_EXPOSURE
     if total_open + size > max_open:
         remaining = max_open - total_open
         if remaining < MIN_TRADE_SIZE:
