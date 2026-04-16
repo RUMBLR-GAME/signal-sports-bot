@@ -15,6 +15,7 @@ from config import (
     POLYMARKET_PRIVATE_KEY, POLYMARKET_FUNDER_ADDRESS,
     SIGNATURE_TYPE, MAX_ORDERS_PER_MINUTE,
     SPORT_TAG_SLUGS, FUTURES_BLOCK,
+    POLY_SERIES_IDS, POLY_GAMES_TAG_ID,
 )
 
 logger = logging.getLogger("clob")
@@ -144,23 +145,29 @@ class ClobInterface:
     # ─── MARKET DISCOVERY ────────────────────────────────────────────────
 
     async def fetch_polymarket_events(self, sport: str) -> list[dict]:
-        tag = SPORT_TAG_SLUGS.get(sport)
-        if not tag:
+        """
+        Fetch current game markets using the OFFICIAL Polymarket API pattern:
+          /events?series_id={id}&tag_id=100639&active=true&closed=false&order=startTime&ascending=true
+        This returns ONLY today/upcoming game markets, filtered for games (not futures).
+        """
+        series_id = POLY_SERIES_IDS.get(sport)
+        if not series_id:
             return []
         try:
             session = await self._get_session()
             params = {
+                "series_id": series_id,
+                "tag_id": POLY_GAMES_TAG_ID,  # 100639 = games only
                 "active": "true",
                 "closed": "false",
                 "archived": "false",
-                "tag_slug": tag,
                 "limit": 100,
-                "order": "endDate",
-                "ascending": "true",  # soonest-ending first = current games
+                "order": "startTime",
+                "ascending": "true",
             }
             async with session.get(f"{GAMMA_API}/events", params=params) as resp:
                 if resp.status != 200:
-                    logger.warning(f"Gamma API {sport} ({tag}): HTTP {resp.status}")
+                    logger.warning(f"Gamma API {sport} (series {series_id}): HTTP {resp.status}")
                     return []
                 data = await resp.json()
         except Exception as e:
@@ -168,6 +175,7 @@ class ClobInterface:
             return []
 
         raw = data if isinstance(data, list) else []
+        # tag_id=100639 already filters futures, but double-check with title block
         filtered = [
             ev for ev in raw
             if not any(w in ev.get("title", "").lower() for w in FUTURES_BLOCK)
@@ -175,19 +183,25 @@ class ClobInterface:
         if not hasattr(self, "_poly_diag"):
             self._poly_diag = {}
         self._poly_diag[sport] = {
-            "tag": tag, "raw": len(raw), "filtered": len(filtered),
+            "tag": f"series={series_id}", "raw": len(raw), "filtered": len(filtered),
             "sample_titles": [ev.get("title","") for ev in filtered[:5]],
         }
         return filtered
 
     async def fetch_all_active_markets(self) -> list[dict]:
-        """Fetch ALL active Polymarket markets (for Poly Arber). Filtered for game markets only."""
+        """Fetch current game markets across all leagues (for Poly Arber)."""
         all_markets = []
         try:
             session = await self._get_session()
-            for tag in SPORT_TAG_SLUGS.values():
+            for series_id in POLY_SERIES_IDS.values():
                 try:
-                    async with session.get(f"{GAMMA_API}/events", params={"active": "true", "tag_slug": tag, "limit": 50}) as resp:
+                    params = {
+                        "series_id": series_id,
+                        "tag_id": POLY_GAMES_TAG_ID,
+                        "active": "true", "closed": "false", "archived": "false",
+                        "limit": 50, "order": "startTime", "ascending": "true",
+                    }
+                    async with session.get(f"{GAMMA_API}/events", params=params) as resp:
                         if resp.status == 200:
                             data = await resp.json()
                             if isinstance(data, list):
@@ -197,7 +211,6 @@ class ClobInterface:
         except Exception as e:
             logger.error(f"fetch_all_active_markets: {e}")
 
-        # Filter out futures/season-long markets — arber should only trade game markets
         return [
             ev for ev in all_markets
             if not any(w in ev.get("title", "").lower() for w in FUTURES_BLOCK)

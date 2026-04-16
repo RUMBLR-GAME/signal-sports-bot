@@ -169,18 +169,19 @@ SOCCER_SPORTS = {
 
 # ─── POLYMARKET TAG SLUGS ────────────────────────────────────────────────────
 SPORT_TAG_SLUGS = {
+    # ── US Major ──
     "nba": "nba", "wnba": "wnba", "nhl": "nhl", "mlb": "mlb",
     "nfl": "nfl", "ncaab": "ncaa-basketball", "ncaaf": "ncaa-football",
-    # Tier 1 soccer
+    # ── Soccer Tier 1 ──
     "epl": "epl", "liga": "la-liga", "seriea": "serie-a",
     "bundes": "bundesliga", "ligue1": "ligue-1",
     "ucl": "champions-league", "uel": "europa-league",
-    # Tier 2 soccer
+    # ── Soccer Tier 2 ──
     "mls": "mls", "ligamx": "liga-mx",
     "erediv": "eredivisie", "liga2": "la-liga-2", "lig2fr": "ligue-2",
     "bund2": "2-bundesliga", "serieb": "serie-b", "porto": "primeira-liga",
     "scotpr": "scottish-premiership", "uecl": "europa-conference-league",
-    # Tier 3 — Sleeping Lion 🦁
+    # ── Soccer Tier 3 — Sleeping Lion ──
     "champ": "efl-championship", "jleag": "japan-j-league", "j2": "j2-league",
     "aleag": "a-league-soccer", "braA": "brazil-serie-a", "braB": "brazil-serie-b",
     "kleag": "k-league", "china": "chinese-super-league",
@@ -190,6 +191,42 @@ SPORT_TAG_SLUGS = {
     "libert": "copa-libertadores", "sudam": "copa-sudamericana",
     "saudi": "saudi-professional-league",
 }
+
+# ─── POLYMARKET SERIES IDs ───────────────────────────────────────────────────
+# From official /sports endpoint. This is THE correct way to fetch game markets.
+# Combined with tag_id=100639 = games-only (no futures).
+POLY_SERIES_IDS = {
+    # US Major
+    "nba": "10345", "nhl": "10346", "mlb": "3",
+    "nfl": "10187", "wnba": "10105",
+    "ncaab": "10470",  # D1 college basketball (men)
+    "ncaaf": "10210",  # college football
+    # Soccer Tier 1 — Big European leagues
+    "epl": "10188", "liga": "10193", "seriea": "10203",
+    "bundes": "10194", "ligue1": "10195",
+    "ucl": "10204", "uel": "10209",
+    # Soccer Tier 2
+    "mls": "10189", "ligamx": "10290",
+    "erediv": "10286", "porto": "10330",
+    "uecl": "10437",
+    # Soccer Tier 3 — Sleeping Lion (THE goldmine)
+    "champ": "10230",    # EFL Championship
+    "jleag": "10360",    # J-League
+    "j2": "10443",       # J2 League (244 markets!)
+    "aleag": "10438",    # A-League (Brisbane home 🇦🇺)
+    "braA": "10359",     # Brazil Série A
+    "kleag": "10444",    # K-League
+    "china": "10439",    # Chinese Super League
+    "turk": "10292",     # Turkish Süper Lig
+    "norw": "10362",     # Norway Eliteserien
+    "denm": "10363",     # Denmark Superliga
+    "saudi": "10361",    # Saudi Pro League
+    "libert": "10289",   # Copa Libertadores
+    "sudam": "10291",    # Copa Sudamericana
+}
+
+# Tag ID 100639 = game markets only (filters out futures/season-long bets)
+POLY_GAMES_TAG_ID = "100639"
 
 # ─── SLEEPING LION — Low-attention market multiplier for Edge Finder ─────────
 # Markets with less retail attention have staler pricing = bigger edge.
