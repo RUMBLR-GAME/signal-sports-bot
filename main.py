@@ -130,13 +130,20 @@ async def bot_loop(clob, positions, bot_state):
                 scans += 1
                 bot_state.update(last_harvest_scan=now, scan_count=scans)
                 try:
-                    signals, live_games = await scan_harvest(clob, positions)
+                    signals, live_games, blowout_log = await scan_harvest(clob, positions)
                     bot_state["live_games"] = live_games
+                    bot_state["blowout_log"] = blowout_log
                     if live_games:
                         log(f"Monitoring {len(live_games)} live games", engine="harvest")
+                    if blowout_log:
+                        for b in blowout_log:
+                            if b["status"] == "signal":
+                                log(f"🎯 {b['leader']} +{b['lead']} — TRADING @{b.get('price',0):.3f}", level="signal", engine="harvest")
+                            elif b["status"] == "skip":
+                                log(f"⚠️ {b['leader']} +{b['lead']} — {b['reason']}", engine="harvest")
                     for s in signals:
                         await execute_signal(s, clob, positions)
-                        log(f"🎯 {s.game.leader} blowout — {s.score_line}", level="signal", engine="harvest")
+                        log(f"🎯 BUY {s.game.leader} YES@{s.clob_price:.2f} edge={s.edge:.1%}", level="trade", engine="harvest")
                 except Exception as e:
                     logger.error(f"Harvest: {e}", exc_info=True)
 

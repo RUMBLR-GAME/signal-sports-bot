@@ -191,7 +191,16 @@ async def _fetch_sport(session, sport):
                 period = int(st.get("period", 1))
                 clock = st.get("displayClock", "0:00")
                 detail = stype.get("detail", "")
-                live.append({"espn_id": eid, "sport": sport, "home": f"{ha} {hs}", "away": f"{aa} {aws}", "detail": detail or f"P{period} {clock}"})
+                live.append({
+                    "espn_id": eid, "sport": sport,
+                    "home_team": ht, "away_team": at,
+                    "home_abbrev": ha, "away_abbrev": aa,
+                    "home_score": hs, "away_score": aws,
+                    "detail": detail or f"P{period} {clock}",
+                    "period": period, "clock": clock,
+                    # Legacy fields for backwards compat
+                    "home": f"{ha} {hs}", "away": f"{aa} {aws}",
+                })
 
                 # Blowout detection
                 lead = abs(hs - aws)

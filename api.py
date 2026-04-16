@@ -80,6 +80,7 @@ def create_api(positions: PositionManager, bot_state: dict) -> web.Application:
                 "scan_log": bot_state.get("scan_log", []),
                 "edges_found": bot_state.get("edges_found", []),
                 "markets_scanned": bot_state.get("markets_scanned", 0),
+                "blowout_log": bot_state.get("blowout_log", []),
             }, headers=_cors(req))
         except Exception as e:
             return web.json_response({"error": str(e)}, status=500, headers=_cors(req))

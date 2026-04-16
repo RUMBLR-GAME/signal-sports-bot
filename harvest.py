@@ -58,34 +58,77 @@ def _match(game, market):
 
 async def scan_harvest(clob, positions):
     signals = []
+    blowout_log = []  # diagnostic: every blowout and its fate
     blowouts, live_games = await fetch_verified_games()
     if not blowouts:
-        return signals, live_games
+        return signals, live_games, blowout_log
     cache = {}
     for game in blowouts:
+        entry = {
+            "sport": game.sport, "leader": game.leader_abbrev,
+            "trailer": game.trailer_abbrev, "lead": game.lead,
+            "confidence": game.confidence, "score_line": game.score_line,
+            "status": "pending", "reason": "",
+        }
+
         if game.confidence < HARVEST_MIN_CONFIDENCE:
+            entry.update(status="skip", reason=f"conf {game.confidence:.3f} < {HARVEST_MIN_CONFIDENCE}")
+            blowout_log.append(entry)
             continue
+
         if game.sport not in cache:
             cache[game.sport] = await clob.fetch_polymarket_events(game.sport)
+
         matched = None
         for ev in cache[game.sport]:
             r = _match(game, ev)
             if r:
                 matched = r
                 break
-        if not matched or positions.has_position_for(matched["condition_id"]):
+
+        if not matched:
+            entry.update(status="skip", reason="no Polymarket market found")
+            blowout_log.append(entry)
+            logger.info(f"⚠️ BLOWOUT {game.leader_abbrev} +{game.lead} but NO POLY MARKET: {game.score_line}")
             continue
+
+        if positions.has_position_for(matched["condition_id"]):
+            entry.update(status="skip", reason="already positioned")
+            blowout_log.append(entry)
+            continue
+
         tid = matched["token_ids"][matched["leader_idx"]]
         price = clob.get_price(tid, "BUY")
-        if price is None or price > HARVEST_MAX_PRICE or price < HARVEST_MIN_PRICE:
+
+        if price is None:
+            entry.update(status="skip", reason="price unavailable")
+            blowout_log.append(entry)
             continue
+        if price > HARVEST_MAX_PRICE:
+            entry.update(status="skip", reason=f"price {price:.3f} > max {HARVEST_MAX_PRICE}", price=price)
+            blowout_log.append(entry)
+            logger.info(f"⚠️ BLOWOUT {game.leader_abbrev} +{game.lead} price={price:.3f} TOO HIGH (>{HARVEST_MAX_PRICE})")
+            continue
+        if price < HARVEST_MIN_PRICE:
+            entry.update(status="skip", reason=f"price {price:.3f} < min {HARVEST_MIN_PRICE}", price=price)
+            blowout_log.append(entry)
+            continue
+
         edge = game.confidence - price
         if edge < HARVEST_MIN_EDGE:
+            entry.update(status="skip", reason=f"edge {edge:.3f} < min {HARVEST_MIN_EDGE}", price=price)
+            blowout_log.append(entry)
             continue
-        # Sport-specific sizing: soccer gets full Kelly, NBA gets half
+
         bet = compute_bet_size("harvest", price, game.confidence, positions.equity, positions, sport=game.sport)
         if bet <= 0:
+            entry.update(status="skip", reason="bet size zero (capital limit?)", price=price)
+            blowout_log.append(entry)
             continue
+
+        entry.update(status="signal", reason="TRADING", price=price, edge=edge, bet=bet)
+        blowout_log.append(entry)
+
         signals.append(HarvestSignal(
             sport=game.sport, game=game, condition_id=matched["condition_id"],
             market_question=matched["question"], team=game.leader, side="YES",
@@ -93,4 +136,5 @@ async def scan_harvest(clob, positions):
             edge=edge, bet_size=bet, score_line=game.score_line,
         ))
         logger.info(f"🎯 HARVEST [{game.sport}]: {game.leader} YES@{price:.3f} conf={game.confidence:.3f} edge={edge:.3f} ${bet}")
-    return signals, live_games
+
+    return signals, live_games, blowout_log
