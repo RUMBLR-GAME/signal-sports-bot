@@ -130,6 +130,26 @@ ODDS_API_SHARP_BOOKS = ["pinnacle", "betfair_ex_uk", "betfair", "bet365", "willi
 POLY_STALE_QUOTE_SEC = _int("POLY_STALE_QUOTE_SEC", 1800)
 POLY_STALE_PENALTY = _flt("POLY_STALE_PENALTY", 0.5)
 
+# ─── LINEUP WATCHER (v18.1) ──────────────────────────────────────────────────
+# Scrapes starting lineups for obscure soccer leagues ~75min before kickoff.
+# Used by the Edge engine to boost/dampen effective edge when team news hits.
+# Requires api-football.com free tier key (100 req/day). Flag-gated.
+API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY", "").strip()
+API_FOOTBALL_BASE = "https://v3.football.api-sports.io"
+LINEUP_WATCHER_ENABLED = _bool("LINEUP_WATCHER_ENABLED", False) and bool(API_FOOTBALL_KEY)
+
+# api-football league IDs → our internal sport keys → (api_league_id, season)
+# J2 League (api id 99), A-League (188), Championship (40) at time of writing.
+# Season is the starting year for European leagues, calendar year for J-League.
+LINEUP_WATCH_LEAGUES = {
+    "j2":    (99,  2026),   # J2 League (calendar-year season)
+    "aleag": (188, 2025),   # A-League Men 2025-26
+    "champ": (40,  2025),   # English Championship 2025-26
+}
+LINEUP_CHECK_INTERVAL = _int("LINEUP_CHECK_INTERVAL", 120)  # sec between polls
+LINEUP_PRE_GAME_WINDOW_MIN = _int("LINEUP_PRE_GAME_WINDOW_MIN", 75)
+LINEUP_FETCH_LEAD_MIN = _int("LINEUP_FETCH_LEAD_MIN", 90)
+
 # ─── ESPN SPORTS ─────────────────────────────────────────────────────────────
 _S = {"slug": "soccer", "periods": 2, "period_name": "H"}
 

@@ -152,6 +152,10 @@ def create_api(positions: PositionManager, bot_state: dict) -> web.Application:
                     "odds_api_enabled": bot_state.get("odds_api_enabled", False),
                     "harvest_enabled": bot_state.get("harvest_enabled", True),
                     "edge_enabled": bot_state.get("edge_enabled", True),
+                    "lineup_watcher_enabled": bot_state.get("lineup_watcher_enabled", False),
+                    # Lineup watcher
+                    "lineup_signals": bot_state.get("lineup_signals", []),
+                    "lineup_api_budget": bot_state.get("lineup_api_budget", {"used": 0, "limit": 0, "remaining": 0}),
                     # Safety
                     "circuit": positions.circuit,
                     "paused_until": bot_state.get("paused_until", 0),

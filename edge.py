@@ -81,9 +81,12 @@ def _ts_until(commence_time: str) -> Optional[float]:
 async def scan_edge(
     clob: ClobInterface, positions: PositionManager,
     all_odds: List[GameOdds],
+    lineup_watcher=None,
 ) -> Tuple[List[EdgeSignal], List[dict]]:
     """
     all_odds: combined list of GameOdds from ESPN + Odds API.
+    lineup_watcher: optional LineupWatcher instance. When provided, its
+      signals shift effective edge for matches where team news has landed.
     Returns (signals, all_edges_for_dashboard).
     """
     signals: List[EdgeSignal] = []
@@ -149,12 +152,29 @@ async def scan_edge(
             ai = parsed["_away_idx"]
             stale = _market_is_stale(parsed)
 
+            # Consult lineup watcher (if enabled) for team-news edge shift
+            lineup_sig = None
+            lineup_shift_home = 0.0
+            lineup_shift_away = 0.0
+            if lineup_watcher is not None:
+                lineup_sig = lineup_watcher.get_signal(odds.home_team, odds.away_team)
+                if lineup_sig:
+                    # home_impact negative means home weakened → home true_prob ↓, away ↑
+                    h_imp = lineup_sig.get("home_impact", 0.0)
+                    a_imp = lineup_sig.get("away_impact", 0.0)
+                    conf = lineup_sig.get("confidence", 0.0)
+                    # Scale by confidence
+                    lineup_shift_home = h_imp * conf
+                    lineup_shift_away = a_imp * conf
+
             # Evaluate both sides
             sides = [
-                (odds.home_team, odds.home_prob, odds.home_ml, hi),
-                (odds.away_team, odds.away_prob, odds.away_ml, ai),
+                (odds.home_team, odds.home_prob + lineup_shift_home, odds.home_ml, hi, lineup_shift_home),
+                (odds.away_team, odds.away_prob + lineup_shift_away, odds.away_ml, ai, lineup_shift_away),
             ]
-            for team, true_prob, ml, idx in sides:
+            for team, true_prob, ml, idx, lineup_adj in sides:
+                # Clamp to valid probability
+                true_prob = max(0.02, min(0.98, true_prob))
                 tid = parsed["token_ids"][idx]
                 poly_price = await clob.get_price(tid, "BUY")
                 if poly_price is None:
@@ -174,6 +194,8 @@ async def scan_edge(
                     "provider": odds.provider, "moneyline": ml,
                     "hours": round(hours, 1),
                     "stale": stale,
+                    "lineup_adj": round(lineup_adj, 4) if lineup_adj else 0,
+                    "lineup_detail": (lineup_sig or {}).get("detail", "") if lineup_adj else "",
                     "commence_time": odds.commence_time,
                     "liquidity": parsed.get("liquidity", 0),
                 })

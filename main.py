@@ -35,6 +35,7 @@ from harvest import scan_harvest
 from edge import scan_edge, check_edge_exits
 from api import create_api
 from polymarket_ws import SportsWS, MarketWS
+from lineup_watcher import LineupWatcher
 import espn
 import odds_api
 
@@ -234,7 +235,7 @@ async def enrich_live_games(clob: ClobInterface, bot_state: dict, market_ws: Mar
 
 
 # ─── Main loop ────────────────────────────────────────────────────────
-async def bot_loop(clob, positions, bot_state, sports_ws: SportsWS, market_ws: MarketWS):
+async def bot_loop(clob, positions, bot_state, sports_ws: SportsWS, market_ws: MarketWS, lineup_watcher=None):
     last = {
         "harvest": 0.0, "edge_scan": 0.0, "edge_exit": 0.0,
         "resolve": 0.0, "partials": 0.0, "equity": 0.0,
@@ -340,7 +341,7 @@ async def bot_loop(clob, positions, bot_state, sports_ws: SportsWS, market_ws: M
                     if paused or not circuit_ok:
                         _log_event(bot_state, "Paused", engine="edge", level="warning")
                     else:
-                        signals, all_edges = await scan_edge(clob, positions, all_odds)
+                        signals, all_edges = await scan_edge(clob, positions, all_odds, lineup_watcher=lineup_watcher)
                         bot_state["edges_found"] = all_edges
                         if signals:
                             _log_event(
@@ -407,6 +408,16 @@ async def bot_loop(clob, positions, bot_state, sports_ws: SportsWS, market_ws: M
             bot_state["ws_market_connected"] = market_ws.is_connected()
             _sec = sports_ws.seconds_since_last_message()
             bot_state["last_ws_sports_msg"] = (time.time() - _sec) if _sec < 1e8 else 0
+
+            # Publish lineup watcher state (if active)
+            if lineup_watcher is not None and lineup_watcher.is_enabled():
+                bot_state["lineup_signals"] = lineup_watcher.active_signals()
+                bot_state["lineup_api_budget"] = lineup_watcher.api_budget()
+                bot_state["lineup_watcher_enabled"] = True
+            else:
+                bot_state["lineup_signals"] = []
+                bot_state["lineup_api_budget"] = {"used": 0, "limit": 0, "remaining": 0}
+                bot_state["lineup_watcher_enabled"] = False
 
             await asyncio.sleep(5)
         except asyncio.CancelledError:
@@ -480,6 +491,11 @@ async def main():
     await sports_ws.start(session)
     await market_ws.start(session)
 
+    # Lineup watcher (flag-gated; inert if no API key)
+    lineup_watcher = LineupWatcher()
+    await lineup_watcher.start(session)
+    bot_state["lineup_watcher_enabled"] = lineup_watcher.is_enabled()
+
     # HTTP API
     app = create_api(positions, bot_state)
     runner = web.AppRunner(app)
@@ -488,10 +504,11 @@ async def main():
     logger.info(f"API on :{API_PORT}")
 
     try:
-        await bot_loop(clob, positions, bot_state, sports_ws, market_ws)
+        await bot_loop(clob, positions, bot_state, sports_ws, market_ws, lineup_watcher)
     finally:
         await sports_ws.stop()
         await market_ws.stop()
+        await lineup_watcher.stop()
         await clob.close()
         await session.close()
         await runner.cleanup()
