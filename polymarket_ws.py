@@ -284,6 +284,11 @@ class MarketWS:
         bid, ask = self.best(token_id)
         if bid is None or ask is None:
             return None
+        # Reject empty/degenerate books: if bid=0 and ask=1, the midpoint
+        # looks like 0.5 but is meaningless — there's no actual market here.
+        # Also reject any market with a spread > 0.5 as untrustworthy.
+        if ask - bid > 0.5:
+            return None
         return (bid + ask) / 2.0
 
     def last_trade(self, token_id: str) -> Optional[float]:

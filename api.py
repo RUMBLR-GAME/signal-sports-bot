@@ -156,6 +156,8 @@ def create_api(positions: PositionManager, bot_state: dict) -> web.Application:
                     # Lineup watcher
                     "lineup_signals": bot_state.get("lineup_signals", []),
                     "lineup_api_budget": bot_state.get("lineup_api_budget", {"used": 0, "limit": 0, "remaining": 0}),
+                    # Infra
+                    "redis_connected": getattr(positions, "_redis_ok", False),
                     # Safety
                     "circuit": positions.circuit,
                     "paused_until": bot_state.get("paused_until", 0),

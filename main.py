@@ -206,11 +206,21 @@ async def enrich_live_games(clob: ClobInterface, bot_state: dict, market_ws: Mar
             tokens_to_subscribe.extend([home_tok, away_tok])
 
             # Price fetching priority:
-            # 1. WS midpoint (push-based, real-time, free)
+            # 1. WS midpoint (push-based, real-time, free) — IF bid/ask are valid
             # 2. REST /price (live from CLOB, one HTTP call)
             # 3. Gamma outcomePrices (STALE — only as labeling fallback, never for trading)
             home_price = market_ws.midpoint(home_tok)
             away_price = market_ws.midpoint(away_tok)
+
+            # Reject suspect WS midpoints. When Polymarket's orderbook has no
+            # bids/asks (thin or empty book), `best()` returns (0, 1) → midpoint 0.5.
+            # That's a garbage signal indistinguishable from a genuine 50/50 market.
+            # Reject exactly 0.5 — if real probability is 0.5, REST will return 0.5 too.
+            if home_price is not None and abs(home_price - 0.5) < 0.001:
+                home_price = None
+            if away_price is not None and abs(away_price - 0.5) < 0.001:
+                away_price = None
+
             debug_tag = f"{g.get('away_team','?')[:10]}@{g.get('home_team','?')[:10]}"
             logger.info(f"enrich {debug_tag}: WS home={home_price} away={away_price}")
 
