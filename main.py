@@ -211,6 +211,8 @@ async def enrich_live_games(clob: ClobInterface, bot_state: dict, market_ws: Mar
             # 3. Gamma outcomePrices (STALE — only as labeling fallback, never for trading)
             home_price = market_ws.midpoint(home_tok)
             away_price = market_ws.midpoint(away_tok)
+            debug_tag = f"{g.get('away_team','?')[:10]}@{g.get('home_team','?')[:10]}"
+            logger.info(f"enrich {debug_tag}: WS home={home_price} away={away_price}")
 
             # If WS has no data yet (not subscribed long enough, or thin book),
             # fetch live from CLOB REST. Critical for live games where Gamma is stale.
@@ -218,14 +220,16 @@ async def enrich_live_games(clob: ClobInterface, bot_state: dict, market_ws: Mar
             if home_price is None:
                 try:
                     home_price = await clob.get_price_http(home_tok, "BUY")
+                    logger.info(f"enrich {debug_tag}: HTTP home={home_price}")
                 except Exception as e:
-                    logger.debug(f"live price fetch home: {e}")
+                    logger.warning(f"live price fetch home {debug_tag}: {e}")
                     home_price = None
             if away_price is None:
                 try:
                     away_price = await clob.get_price_http(away_tok, "BUY")
+                    logger.info(f"enrich {debug_tag}: HTTP away={away_price}")
                 except Exception as e:
-                    logger.debug(f"live price fetch away: {e}")
+                    logger.warning(f"live price fetch away {debug_tag}: {e}")
                     away_price = None
 
             # Last-resort fallback: parsed Gamma price. Mark as stale in state.
