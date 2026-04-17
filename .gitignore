@@ -1,4 +1,7 @@
 __pycache__/
 *.pyc
 .env
+.venv/
 state.json
+*.json.bak
+.DS_Store

@@ -1,28 +1,22 @@
 """
-edge.py — Engine 2: Edge Finder (Convergence Trade)
-Buys Polymarket when ESPN sportsbook odds show mispricing.
-EXITS BEFORE THE GAME STARTS — we capture the convergence, not the game risk.
+edge.py — Engine 2: Edge Finder / Convergence Trade (v18)
 
-Strategy:
-  Polymarket = 67% accurate 1-7 days out, 96% accurate at game time.
-  ESPN/FanDuel = ~95% accurate from the moment odds are posted.
-  We buy the gap. Market corrects toward game time. We sell before tip-off.
-
-Exit conditions (checked every 30 seconds):
-  1. TAKE PROFIT: remaining edge < 2% (market corrected)
-  2. PRE-GAME EXIT: 30 min before game start (avoid game risk)
-  3. STOP LOSS: price dropped 5¢ below entry
-  4. STALE: held > 48 hours with no convergence
+Changes from v17:
+  • Accepts combined pregame odds list (ESPN for US + Odds API for soccer)
+  • Uses match_game_to_market (which applies ambiguity rule)
+  • New sizing signature (returns reason, used for diagnostics)
+  • Stale-quote penalty on edge (reduces effective edge, not hard block)
+  • Exit path uses new positions.exit_position semantics
 """
-
+import asyncio
 import logging
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, List, Tuple
 
-from espn import fetch_pregame_odds, GameOdds
-from teams import generate_search_terms as team_search_terms, find_team_in_outcomes
+from espn import GameOdds
+from teams import match_game_to_market, find_team_in_outcomes
 from clob import ClobInterface, parse_market_tokens
 from positions import PositionManager
 from sizing import compute_bet_size
@@ -32,7 +26,9 @@ from config import (
     EDGE_EXIT_REMAINING, EDGE_STOP_LOSS,
     EDGE_PRE_GAME_EXIT_MIN, EDGE_STALE_HOURS,
     MIN_MARKET_LIQUIDITY, MIN_DAILY_VOLUME,
+    POLY_STALE_QUOTE_SEC, POLY_STALE_PENALTY,
 )
+from harvest import _market_is_stale
 
 logger = logging.getLogger("edge")
 
@@ -45,7 +41,8 @@ class EdgeSignal:
     condition_id: str = ""
     market_question: str = ""
     team: str = ""
-    side: str = ""
+    bet_outcome: str = ""
+    outcome_idx: int = 0
     token_id: str = ""
     clob_price: float = 0.0
     true_prob: float = 0.0
@@ -54,203 +51,216 @@ class EdgeSignal:
     moneyline: int = 0
     bet_size: float = 0.0
     confidence: float = 0.0
-    commence_time: str = ""      # ISO 8601 — when game starts
+    commence_time: str = ""
+    sizing_reason: str = ""
 
 
-def _hours_until_game(commence_time: str) -> Optional[float]:
-    """Parse ISO 8601 commence time and return hours until game."""
+def _hours_until(commence_time: str) -> Optional[float]:
     if not commence_time:
         return None
     try:
-        # Handle various ISO formats
         ct = commence_time.replace("Z", "+00:00")
-        if "T" in ct:
-            game_dt = datetime.fromisoformat(ct)
-        else:
-            return None
-        now = datetime.now(timezone.utc)
+        game_dt = datetime.fromisoformat(ct)
         if game_dt.tzinfo is None:
             game_dt = game_dt.replace(tzinfo=timezone.utc)
-        delta = (game_dt - now).total_seconds() / 3600
-        return delta
+        return (game_dt - datetime.now(timezone.utc)).total_seconds() / 3600.0
     except Exception:
         return None
 
 
-def _minutes_until_game(commence_time: str) -> Optional[float]:
-    """Return minutes until game start."""
-    hours = _hours_until_game(commence_time)
-    return hours * 60 if hours is not None else None
+def _ts_until(commence_time: str) -> Optional[float]:
+    if not commence_time:
+        return None
+    try:
+        ct = commence_time.replace("Z", "+00:00")
+        return datetime.fromisoformat(ct).timestamp()
+    except Exception:
+        return None
 
 
-async def scan_edge(clob: ClobInterface, positions: PositionManager) -> tuple[list[EdgeSignal], list[dict]]:
+async def scan_edge(
+    clob: ClobInterface, positions: PositionManager,
+    all_odds: List[GameOdds],
+) -> Tuple[List[EdgeSignal], List[dict]]:
     """
-    Scan for convergence trade opportunities.
-    Returns (tradeable_signals, all_edges_for_dashboard).
-    all_edges includes near-misses below threshold for the scanner view.
+    all_odds: combined list of GameOdds from ESPN + Odds API.
+    Returns (signals, all_edges_for_dashboard).
     """
-    signals = []
-    all_edges = []  # For dashboard — includes sub-threshold edges
-    
-    all_odds = await fetch_pregame_odds()
+    signals: List[EdgeSignal] = []
+    all_edges: List[dict] = []
+
     if not all_odds:
-        return [], []
+        return signals, all_edges
 
-    # Group by sport, deduplicate by game (prefer ESPN BET > FanDuel)
-    by_sport: dict[str, list[GameOdds]] = {}
+    # Group by sport. Prefer sharpest / non-duplicate provider per game.
+    by_sport: dict = {}
     for o in all_odds:
         by_sport.setdefault(o.sport, []).append(o)
 
     for sport, odds_list in by_sport.items():
-        poly_events = await clob.fetch_polymarket_events(sport)
-        if not poly_events:
+        # Fetch Polymarket events for this sport (once)
+        events = await clob.fetch_polymarket_events(sport)
+        if not events:
             continue
 
-        seen: set[str] = set()
-        preferred = ["ESPN BET", "FanDuel", "BetMGM"]
+        # Dedupe by game — pick sharpest provider available
+        preferred = ["Pinnacle", "Betfair", "Bet365", "ESPN BET", "FanDuel", "BetMGM"]
         odds_list.sort(key=lambda o: preferred.index(o.provider) if o.provider in preferred else 99)
+        seen: set = set()
 
         for odds in odds_list:
-            if odds.espn_id in seen:
+            key = (odds.home_team.lower(), odds.away_team.lower(), odds.commence_time[:10])
+            if key in seen:
                 continue
-            seen.add(odds.espn_id)
+            seen.add(key)
 
-            # Check timing — only enter 2-48h before game
-            hours = _hours_until_game(odds.commence_time)
-            if hours is None:
-                continue
-            if hours < EDGE_MIN_HOURS_BEFORE or hours > EDGE_MAX_HOURS_BEFORE:
+            hours = _hours_until(odds.commence_time)
+            if hours is None or hours < EDGE_MIN_HOURS_BEFORE or hours > EDGE_MAX_HOURS_BEFORE:
                 continue
 
-            # Try to match to Polymarket
-            for ev in poly_events:
-                parsed = parse_market_tokens(ev)
-                if not parsed:
+            # Find Polymarket market
+            parsed = None
+            for ev in events:
+                p = parse_market_tokens(ev)
+                if not p:
                     continue
-                if parsed.get("liquidity", 0) < MIN_MARKET_LIQUIDITY:
+                if p.get("liquidity", 0) < MIN_MARKET_LIQUIDITY:
                     continue
-                if parsed.get("volume", 0) < MIN_DAILY_VOLUME:
+                if p.get("volume", 0) < MIN_DAILY_VOLUME:
                     continue
-                if positions.has_position_for(parsed["condition_id"]):
+                hi, ai = match_game_to_market(
+                    odds.home_team, odds.home_abbrev,
+                    odds.away_team, odds.away_abbrev,
+                    p["question"], p["outcomes"],
+                )
+                if hi < 0 or ai < 0:
                     continue
+                p["_home_idx"] = hi
+                p["_away_idx"] = ai
+                parsed = p
+                break
 
-                outcomes = parsed["outcomes"]
+            if not parsed:
+                continue
+            if positions.has_position_for(parsed["condition_id"]):
+                continue
 
-                # Match both teams using robust fuzzy matcher
-                hi = find_team_in_outcomes(odds.home_team, odds.home_abbrev, outcomes)
-                ai = find_team_in_outcomes(odds.away_team, odds.away_abbrev, outcomes)
+            hi = parsed["_home_idx"]
+            ai = parsed["_away_idx"]
+            stale = _market_is_stale(parsed)
 
-                if hi < 0 or ai < 0 or hi == ai:
-                    continue
-
-                # Check both sides - record every scan
-                for team, prob, ml, idx in [
-                    (odds.home_team, odds.home_prob, odds.home_ml, hi),
-                    (odds.away_team, odds.away_prob, odds.away_ml, ai),
-                ]:
-                    tid = parsed["token_ids"][idx]
-                    poly_price = clob.get_price(tid, "BUY")
-                    if poly_price is None:
+            # Evaluate both sides
+            sides = [
+                (odds.home_team, odds.home_prob, odds.home_ml, hi),
+                (odds.away_team, odds.away_prob, odds.away_ml, ai),
+            ]
+            for team, true_prob, ml, idx in sides:
+                tid = parsed["token_ids"][idx]
+                poly_price = await clob.get_price(tid, "BUY")
+                if poly_price is None:
+                    try:
+                        poly_price = float(parsed["prices"][idx])
+                    except Exception:
                         continue
 
-                    edge = prob - poly_price
-                    
-                    # Record EVERY game scanned (even negative edge) for dashboard visibility
-                    all_edges.append({
-                        "team": team, "sport": sport, "poly": poly_price,
-                        "true": prob, "edge": edge, "provider": odds.provider,
-                        "hours": round(hours, 1),
-                    })
+                raw_edge = true_prob - poly_price
+                # Stale penalty reduces effective edge
+                eff_edge = raw_edge * POLY_STALE_PENALTY if stale else raw_edge
 
-                    # Trading filters — price range + minimum edge
-                    if poly_price > EDGE_MAX_PRICE or poly_price < EDGE_MIN_PRICE:
-                        continue
-                    if edge < EDGE_MIN_EDGE:
-                        continue
+                all_edges.append({
+                    "team": team, "sport": sport,
+                    "poly": poly_price, "true": true_prob,
+                    "edge": raw_edge, "effective_edge": eff_edge,
+                    "provider": odds.provider, "moneyline": ml,
+                    "hours": round(hours, 1),
+                    "stale": stale,
+                    "commence_time": odds.commence_time,
+                    "liquidity": parsed.get("liquidity", 0),
+                })
 
-                    bet = compute_bet_size("edge", poly_price, prob, positions.equity, positions, sport=sport, edge=edge)
-                    if bet <= 0:
-                        continue
+                if eff_edge < EDGE_MIN_EDGE:
+                    continue
+                if poly_price > EDGE_MAX_PRICE or poly_price < EDGE_MIN_PRICE:
+                    continue
 
-                    signals.append(EdgeSignal(
-                        sport=sport, espn_id=odds.espn_id,
-                        condition_id=parsed["condition_id"],
-                        market_question=parsed["question"],
-                        team=team, side=outcomes[idx], token_id=tid,
-                        clob_price=poly_price, true_prob=prob, edge=edge,
-                        provider=odds.provider, moneyline=ml,
-                        bet_size=bet, confidence=prob,
-                        commence_time=odds.commence_time,
-                    ))
-                break  # one poly match per ESPN game
+                start_ts = _ts_until(odds.commence_time)
+                equity = positions.equity
+                size, sz_reason = compute_bet_size(
+                    "edge", poly_price, true_prob, equity, positions,
+                    sport=sport, edge=eff_edge, game_start_ts=start_ts,
+                )
+                if size <= 0:
+                    continue
 
-    # Sort all_edges by edge size descending
+                signals.append(EdgeSignal(
+                    sport=sport, espn_id=odds.espn_id,
+                    condition_id=parsed["condition_id"],
+                    market_question=parsed["question"],
+                    team=team,
+                    bet_outcome=parsed["outcomes"][idx],
+                    outcome_idx=idx,
+                    token_id=tid, clob_price=poly_price,
+                    true_prob=true_prob, edge=raw_edge,
+                    provider=odds.provider, moneyline=ml,
+                    bet_size=size, confidence=true_prob,
+                    commence_time=odds.commence_time,
+                    sizing_reason=sz_reason,
+                ))
+                logger.info(
+                    f"EDGE [{sport}]: {team} @{poly_price:.3f} true={true_prob:.3f} "
+                    f"edge={raw_edge:.3f}{' (stale→'+format(eff_edge,'.3f')+')' if stale else ''} "
+                    f"[{odds.provider}] ${size:.2f} | T-{hours:.1f}h"
+                )
+
     all_edges.sort(key=lambda e: e["edge"], reverse=True)
-
-    for s in signals:
-        h = _hours_until_game(s.commence_time)
-        logger.info(
-            f"⚡ EDGE: {s.team} @{s.clob_price:.3f} true={s.true_prob:.3f} "
-            f"edge={s.edge:.3f} [{s.provider}] ${s.bet_size} | game in {h:.1f}h"
-        )
-    return signals, all_edges[:200]
+    return signals, all_edges[:300]
 
 
 async def check_edge_exits(clob: ClobInterface, positions: PositionManager):
     """
-    Check all Edge Finder positions for exit conditions.
-    Runs every 30 seconds — pre-game exit is time-critical.
-
-    Priority:
-      1. PRE-GAME EXIT: 30 min before game (highest priority — avoid game risk)
-      2. TAKE PROFIT: remaining edge < 2%
-      3. STOP LOSS: price dropped 5¢
-      4. STALE: held > 48 hours
+    Priority: pre-game exit > take-profit > stop-loss > stale.
+    Updates position mark-to-market prices along the way.
     """
     for pos in positions.get_filled_by_engine("edge"):
-        current_price = clob.get_price(pos.token_id, "SELL")
-        if current_price is None:
+        current = await clob.get_price(pos.token_id, "SELL")
+        if current is None:
             continue
+        positions.mark_current_price(pos.id, current)
 
         entry = pos.fill_price or pos.entry_price
-        age_hours = (time.time() - pos.opened_at) / 3600
+        age_hours = (time.time() - pos.opened_at) / 3600.0
 
-        # 1. PRE-GAME EXIT — highest priority
-        minutes_to_game = _minutes_until_game(pos.game_start_time)
-        if minutes_to_game is not None and minutes_to_game <= EDGE_PRE_GAME_EXIT_MIN:
-            pnl_preview = (current_price - entry) * pos.size
-            logger.info(
-                f"⏰ PRE-GAME EXIT: {pos.team} | game in {minutes_to_game:.0f}min | "
-                f"entry={entry:.3f} now={current_price:.3f} pnl=${pnl_preview:+.2f}"
-            )
-            await _do_exit(clob, positions, pos, current_price, "pre_game_exit")
+        # 1. Pre-game exit
+        mins_to_game = None
+        if pos.game_start_time:
+            start_ts = _ts_until(pos.game_start_time)
+            if start_ts is not None:
+                mins_to_game = (start_ts - time.time()) / 60.0
+        if mins_to_game is not None and mins_to_game <= EDGE_PRE_GAME_EXIT_MIN:
+            await _do_exit(clob, positions, pos, current, f"pre_game (T-{mins_to_game:.0f}m)")
             continue
 
-        # 2. TAKE PROFIT — edge consumed by market convergence
-        remaining_edge = pos.true_prob - current_price
-        if remaining_edge < EDGE_EXIT_REMAINING and current_price > entry:
-            logger.info(f"💰 TAKE PROFIT: {pos.team} entry={entry:.3f} now={current_price:.3f} remaining_edge={remaining_edge:.3f}")
-            await _do_exit(clob, positions, pos, current_price, "take_profit")
+        # 2. Take profit: remaining edge consumed
+        remaining_edge = pos.true_prob - current
+        if remaining_edge < EDGE_EXIT_REMAINING and current > entry:
+            await _do_exit(clob, positions, pos, current, f"take_profit (edge left {remaining_edge:.3f})")
             continue
 
-        # 3. STOP LOSS — model was wrong or new info arrived
-        if current_price < entry - EDGE_STOP_LOSS:
-            logger.info(f"🛑 STOP LOSS: {pos.team} entry={entry:.3f} now={current_price:.3f}")
-            await _do_exit(clob, positions, pos, current_price, "stop_loss")
+        # 3. Stop loss
+        if current < entry - EDGE_STOP_LOSS:
+            await _do_exit(clob, positions, pos, current, f"stop_loss @{current:.3f}")
             continue
 
-        # 4. STALE — no convergence after 48h
+        # 4. Stale
         if age_hours > EDGE_STALE_HOURS:
-            logger.info(f"⏳ STALE EXIT: {pos.team} held {age_hours:.1f}h, entry={entry:.3f} now={current_price:.3f}")
-            await _do_exit(clob, positions, pos, current_price, "stale_exit")
+            await _do_exit(clob, positions, pos, current, f"stale (held {age_hours:.1f}h)")
             continue
 
 
 async def _do_exit(clob, positions, pos, price, reason):
-    """Execute an exit — place SELL order and record."""
     if clob.is_authenticated():
-        result = clob.place_order(pos.token_id, price, pos.size, "SELL")
-        if not result:
+        ok = await clob.place_order(pos.token_id, price, pos.size, "SELL")
+        if not ok:
             logger.warning(f"Exit SELL failed for {pos.team}")
             return
     await positions.exit_position(pos.id, price, reason)
