@@ -145,7 +145,16 @@ async def scan_edge(
 
             if not parsed:
                 continue
-            if positions.has_position_for(parsed["condition_id"]):
+            # Check all condition_ids for this event (soccer has multiple —
+            # home-win, away-win, draw are separate markets, must not trade both).
+            cids_to_check = parsed.get("_condition_ids") or [parsed["condition_id"]]
+            if any(positions.has_position_for(c) for c in cids_to_check):
+                continue
+            # Belt-and-braces: also reject if we already have an edge position
+            # on either team (same game = one bet maximum).
+            if positions.has_position_for_game(
+                odds.home_team, odds.away_team, engine="edge"
+            ):
                 continue
 
             hi = parsed["_home_idx"]
