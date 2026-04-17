@@ -205,18 +205,41 @@ async def enrich_live_games(clob: ClobInterface, bot_state: dict, market_ws: Mar
             away_tok = parsed["token_ids"][ai]
             tokens_to_subscribe.extend([home_tok, away_tok])
 
-            # Prefer WS cache (push-based, no REST)
+            # Price fetching priority:
+            # 1. WS midpoint (push-based, real-time, free)
+            # 2. REST /price (live from CLOB, one HTTP call)
+            # 3. Gamma outcomePrices (STALE — only as labeling fallback, never for trading)
             home_price = market_ws.midpoint(home_tok)
             away_price = market_ws.midpoint(away_tok)
-            # Fall back to parsed prices from Gamma (already have them!)
+
+            # If WS has no data yet (not subscribed long enough, or thin book),
+            # fetch live from CLOB REST. Critical for live games where Gamma is stale.
+            if home_price is None:
+                try:
+                    home_price = await clob.get_price(home_tok, "BUY")
+                except Exception as e:
+                    logger.debug(f"live price fetch home: {e}")
+                    home_price = None
+            if away_price is None:
+                try:
+                    away_price = await clob.get_price(away_tok, "BUY")
+                except Exception as e:
+                    logger.debug(f"live price fetch away: {e}")
+                    away_price = None
+
+            # Last-resort fallback: parsed Gamma price. Mark as stale in state.
+            # This lets the dashboard show SOMETHING but bot logic treats 0.5 as untrustworthy.
+            price_is_stale = False
             if home_price is None:
                 try:
                     home_price = float(parsed["prices"][hi])
+                    price_is_stale = True
                 except Exception:
                     home_price = None
             if away_price is None:
                 try:
                     away_price = float(parsed["prices"][ai])
+                    price_is_stale = True
                 except Exception:
                     away_price = None
 
@@ -224,6 +247,7 @@ async def enrich_live_games(clob: ClobInterface, bot_state: dict, market_ws: Mar
                 g["home_poly"] = round(home_price, 3)
             if away_price is not None:
                 g["away_poly"] = round(away_price, 3)
+            g["poly_price_stale"] = price_is_stale
             g["market"] = parsed["question"][:80]
             g["condition_id"] = parsed["condition_id"]
             g["home_token_id"] = home_tok
