@@ -100,25 +100,30 @@ async def _get(session: aiohttp.ClientSession, path: str, params: dict) -> Optio
         return None
     params = {**params, "apiKey": ODDS_API_KEY}
     url = f"{ODDS_API_BASE}{path}"
-    try:
-        async with session.get(url, params=params, timeout=TIMEOUT) as r:
-            _record_request()
-            if r.status == 401:
-                logger.error("odds_api: 401 unauthorized — check ODDS_API_KEY")
-                return None
-            if r.status == 429:
-                logger.warning("odds_api: 429 rate limited")
-                return None
-            if r.status != 200:
-                logger.debug(f"odds_api {path}: HTTP {r.status}")
-                return None
-            return await r.json()
-    except asyncio.TimeoutError:
-        logger.debug(f"odds_api {path}: timeout")
-        return None
-    except Exception as e:
-        logger.debug(f"odds_api {path}: {e}")
-        return None
+    # Retry up to 3 times on 429 with exponential backoff
+    for attempt in range(3):
+        try:
+            async with session.get(url, params=params, timeout=TIMEOUT) as r:
+                _record_request()
+                if r.status == 401:
+                    logger.error("odds_api: 401 unauthorized — check ODDS_API_KEY")
+                    return None
+                if r.status == 429:
+                    wait = 2 ** attempt  # 1s, 2s, 4s
+                    logger.warning(f"odds_api: 429 rate limited, backing off {wait}s (attempt {attempt+1}/3)")
+                    await asyncio.sleep(wait)
+                    continue
+                if r.status != 200:
+                    logger.debug(f"odds_api {path}: HTTP {r.status}")
+                    return None
+                return await r.json()
+        except asyncio.TimeoutError:
+            logger.debug(f"odds_api {path}: timeout (attempt {attempt+1})")
+            await asyncio.sleep(1)
+        except Exception as e:
+            logger.debug(f"odds_api {path}: {e}")
+            return None
+    return None
 
 
 async def _fetch_events_for_league(
@@ -333,20 +338,39 @@ async def _fetch_league_cached(
 
 
 # ─── Public API ────────────────────────────────────────────────────────────
+# Limit concurrent API calls to avoid 429s (odds-api.io allows 100/hour
+# but trips rate limiter with bursts >6 concurrent).
+_CONCURRENCY = asyncio.Semaphore(3)
+
+
+async def _fetch_with_throttle(
+    session: aiohttp.ClientSession,
+    sport_key: str,
+    league_slug: str,
+    bookmakers: List[str],
+) -> List[GameOdds]:
+    async with _CONCURRENCY:
+        result = await _fetch_league_cached(session, sport_key, league_slug, bookmakers)
+        # Gentle spacing between league fetches
+        await asyncio.sleep(0.3)
+        return result
+
+
 async def fetch_all_soccer(session: aiohttp.ClientSession) -> List[GameOdds]:
     if not is_enabled():
         return []
     bookmakers = ODDS_API_BOOKMAKERS or ["Bet365", "DraftKings"]
     tasks = [
-        _fetch_league_cached(session, sport_key, league_slug, bookmakers)
+        _fetch_with_throttle(session, sport_key, league_slug, bookmakers)
         for sport_key, league_slug in ODDS_API_LEAGUE_MAP.items()
     ]
     try:
         results = await asyncio.wait_for(
             asyncio.gather(*tasks, return_exceptions=True),
-            timeout=120,
+            timeout=180,
         )
     except asyncio.TimeoutError:
+        logger.warning("odds_api: fetch_all_soccer timed out")
         return []
     out: List[GameOdds] = []
     for r in results:
