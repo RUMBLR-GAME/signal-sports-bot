@@ -206,39 +206,54 @@ ESPN_SPORTS = {
 # Sports where ESPN embeds FanDuel/ESPN BET odds
 ESPN_ODDS_SPORTS = {"nba", "wnba", "nhl", "mlb", "nfl", "ncaab", "ncaaf", "mls"}
 
-# Map our internal sport key → list of keywords that match odds-api.io's `league` field.
-# We filter client-side since odds-api.io's league name conventions aren't documented.
-# Multiple keywords allow fuzzy matching (e.g. "J2" matches "J2 League", "Japan J2", etc).
+# Map our internal sport key → odds-api.io league slug.
+# ALL slugs below VERIFIED against live odds-api.io /events endpoint 2026-04-17.
+# Slug format: {country}-{league-kebab}, some with dots/dashes in country name.
 _ODDS_API_FULL_MAP = {
-    "epl":    ["Premier League", "English Premier"],
-    "liga":   ["La Liga", "LaLiga", "Spanish"],
-    "seriea": ["Serie A"],
-    "bundes": ["Bundesliga"],
-    "ligue1": ["Ligue 1"],
-    "ucl":    ["Champions League", "UEFA Champions"],
-    "uel":    ["Europa League"],
-    "champ":  ["Championship", "EFL Championship"],
-    "jleag":  ["J1 League", "J-League"],
-    "j2":     ["J2 League", "J.League 2"],
-    "aleag":  ["A-League", "A League"],
-    "braA":   ["Brasileirão", "Brazilian Serie A", "Brasileirao"],
-    "braB":   ["Brazilian Serie B", "Brasileirão B"],
-    "kleag":  ["K League"],
-    "china":  ["Chinese Super", "CSL"],
-    "norw":   ["Eliteserien"],
-    "denm":   ["Superligaen", "Danish Super"],
-    "ligamx": ["Liga MX"],
-    "turk":   ["Süper Lig", "Super Lig", "Turkish"],
-    "erediv": ["Eredivisie"],
-    "porto":  ["Primeira Liga", "Portuguese"],
-    "libert": ["Copa Libertadores"],
-    "sudam":  ["Copa Sudamericana"],
-    "saudi":  ["Saudi Pro", "Saudi League"],
+    # European top flights
+    "epl":    "england-premier-league",
+    "liga":   "spain-laliga",
+    "seriea": "italy-serie-a",
+    "bundes": "germany-bundesliga",
+    "ligue1": "france-ligue-1",
+    # European second tiers (sleeping lions — often in-season when top flight isn't)
+    "champ":  "england-championship",
+    "liga2":  "spain-laliga-2",
+    "bund2":  "germany-2-bundesliga",
+    "lig2fr": "france-ligue-2",
+    "erediv2": "netherlands-eerste-divisie",
+    # Other in-season European pro men's leagues (from verified list)
+    "erediv": "netherlands-eredivisie",
+    "ekstra": "poland-ekstraklasa",
+    "allsv":  "sweden-allsvenskan",
+    "rom":    "romania-superliga",
+    "tur":    "turkiye-super-lig",
+    "irepr":  "ireland-premier-division",
+    "cro":    "croatia-hnl",
+    # European cups
+    "ucl":    "international-clubs-uefa-champions-league",
+    "uel":    "international-clubs-uefa-europa-league",
+    # Asia / Oceania
+    "china":  "china-chinese-super-league",
+    "aleag":  "australia-a-league",
+    "india":  "india-indian-super-league",
+    "afc":    "international-clubs-afc-champions-league-elite",
+    # Off-season (still mapped for when they start)
+    "jleag":  "japan-j-league",
+    "j2":     "japan-j-league-2",
+    "kleag":  "republic-of-korea-k-league-1",
+    "braA":   "brazil-serie-a",
+    "braB":   "brazil-serie-b",
+    # Latin America (in-season ones)
+    "colA":   "colombia-primera-a-apertura",
+    "libert": "international-clubs-copa-libertadores",
+    "sudam":  "international-clubs-copa-sudamericana",
+    "ligamx": "mexico-liga-mx",
 }
 
-# Default budget-safe set: the "sleeping lion" leagues + Championship for Saturday volume.
+# Default = leagues CONFIRMED to have upcoming games as of 2026-04-17.
 # Override with ODDS_API_LEAGUES env var (comma-separated sport keys, or "all").
-_DEFAULT_ODDS_LEAGUES = "j2,aleag,champ,braA"
+_DEFAULT_ODDS_LEAGUES = "champ,aleag,erediv2,lig2fr,bund2,seriea,china,tur,allsv,ekstra"
 _LEAGUE_FILTER = os.getenv("ODDS_API_LEAGUES", _DEFAULT_ODDS_LEAGUES).strip()
 if _LEAGUE_FILTER.lower() == "all":
     ODDS_API_LEAGUE_MAP = _ODDS_API_FULL_MAP
