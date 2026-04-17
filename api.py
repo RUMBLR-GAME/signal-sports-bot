@@ -15,6 +15,7 @@ from aiohttp import web
 
 from config import CORS_ORIGINS, PAPER_MODE, STARTING_BANKROLL
 from positions import PositionManager
+from clob import ClobInterface
 
 logger = logging.getLogger("api")
 
@@ -29,7 +30,7 @@ def _cors_headers(req):
     }
 
 
-def create_api(positions: PositionManager, bot_state: dict) -> web.Application:
+def create_api(positions: PositionManager, bot_state: dict, clob: ClobInterface = None) -> web.Application:
     app = web.Application()
 
     async def options(req):
@@ -194,7 +195,58 @@ def create_api(positions: PositionManager, bot_state: dict) -> web.Application:
         await positions._reset()
         return web.json_response({"ok": True, "reset": True}, headers=_cors_headers(req))
 
-    for path in ["/api/state", "/health", "/api/pause", "/api/resume", "/api/reset"]:
+    async def close_position(req):
+        """POST /api/close/{position_id} — force close a single open position at current market price."""
+        pid = req.match_info.get("position_id", "")
+        p = positions.positions.get(pid)
+        if not p:
+            return web.json_response({"error": f"position {pid} not found"}, status=404, headers=_cors_headers(req))
+        # Fetch current SELL (bid) side price — that's what we'd actually get
+        current = await clob.get_price_http(p.token_id, "SELL")
+        if current is None:
+            # Fallback to last marked price if we have it
+            current = getattr(p, "current_price", None) or p.entry_price
+        trade = await positions.force_close(pid, current, reason="api_close")
+        if not trade:
+            return web.json_response({"error": "close failed"}, status=500, headers=_cors_headers(req))
+        return web.json_response({
+            "ok": True, "position_id": pid, "exit_price": current,
+            "pnl": trade.pnl, "pnl_pct": trade.pnl_pct,
+        }, headers=_cors_headers(req))
+
+    async def close_all(req):
+        """POST /api/close-all — force close ALL open positions. Requires confirm=CLOSE_ALL."""
+        try:
+            body = await req.json()
+        except Exception:
+            body = {}
+        if body.get("confirm") != "CLOSE_ALL":
+            return web.json_response(
+                {"error": "requires confirm=CLOSE_ALL"}, status=400, headers=_cors_headers(req)
+            )
+        closed = []
+        # Snapshot IDs first — force_close mutates self.positions
+        ids = list(positions.positions.keys())
+        for pid in ids:
+            p = positions.positions.get(pid)
+            if not p:
+                continue
+            current = await clob.get_price_http(p.token_id, "SELL")
+            if current is None:
+                current = getattr(p, "current_price", None) or p.entry_price
+            trade = await positions.force_close(pid, current, reason="close_all")
+            if trade:
+                closed.append({
+                    "position_id": pid, "team": p.team, "exit_price": current,
+                    "pnl": trade.pnl,
+                })
+        return web.json_response({
+            "ok": True, "closed": len(closed),
+            "total_pnl": sum(c["pnl"] for c in closed),
+            "trades": closed,
+        }, headers=_cors_headers(req))
+
+    for path in ["/api/state", "/health", "/api/pause", "/api/resume", "/api/reset", "/api/close-all"]:
         app.router.add_route("OPTIONS", path, options)
     app.router.add_route("GET", "/api/state", state)
     app.router.add_route("GET", "/health", health)
@@ -202,4 +254,6 @@ def create_api(positions: PositionManager, bot_state: dict) -> web.Application:
     app.router.add_route("POST", "/api/pause", pause)
     app.router.add_route("POST", "/api/resume", resume)
     app.router.add_route("POST", "/api/reset", reset)
+    app.router.add_route("POST", "/api/close/{position_id}", close_position)
+    app.router.add_route("POST", "/api/close-all", close_all)
     return app

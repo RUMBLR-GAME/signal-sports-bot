@@ -536,7 +536,7 @@ async def main():
     bot_state["lineup_watcher_enabled"] = lineup_watcher.is_enabled()
 
     # HTTP API
-    app = create_api(positions, bot_state)
+    app = create_api(positions, bot_state, clob)
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", API_PORT).start()

@@ -96,6 +96,11 @@ HARVEST_MIN_CONFIDENCE = _flt("HARVEST_MIN_CONFIDENCE", 0.97)
 HARVEST_MAX_PRICE = _flt("HARVEST_MAX_PRICE", 0.97)
 HARVEST_MIN_PRICE = _flt("HARVEST_MIN_PRICE", 0.80)
 HARVEST_MIN_EDGE = _flt("HARVEST_MIN_EDGE", 0.01)
+
+# Portfolio-wide caps: prevent the bot from deploying 100% of capital at once
+# and leaving nothing in reserve for better edges that appear later.
+MAX_TOTAL_EXPOSURE_PCT = _flt("MAX_TOTAL_EXPOSURE_PCT", 0.6)  # max 60% of bankroll in open positions
+MAX_OPEN_POSITIONS = int(_flt("MAX_OPEN_POSITIONS", 8))  # diversification cap
 # Partial exit: sell 50% when price reaches this level. Recycles capital.
 HARVEST_PARTIAL_EXIT_PRICE = _flt("HARVEST_PARTIAL_EXIT_PRICE", 0.985)
 HARVEST_PARTIAL_EXIT_FRAC = _flt("HARVEST_PARTIAL_EXIT_FRAC", 0.50)
@@ -182,8 +187,11 @@ ESPN_SPORTS = {
     "bund2":  {"league": "ger.2",  **_S},
     "serieb": {"league": "ita.2",  **_S},
     "porto":  {"league": "por.1",  **_S},
-    "scotpr": {"league": "sco.1",  **_S},
-    "uecl":   {"league": "uefa.europa.conf", **_S},
+    # NOTE: Scottish Premiership and UEFA Conference League disabled — not listed
+    # on Polymarket (verified against /sports catalog 2026-04-18, 179 series, none match).
+    # ESPN has the data but bot can't trade them, so we skip fetching to save cycles.
+    # "scotpr": {"league": "sco.1",  **_S},
+    # "uecl":   {"league": "uefa.europa.conf", **_S},
     # Tier 3 — Sleeping Lion
     "champ":  {"league": "eng.2",  **_S},
     "jleag":  {"league": "jpn.1",  **_S},
@@ -276,7 +284,7 @@ WIN_THRESHOLDS = {
 
 SOCCER_SPORTS = {
     "epl", "liga", "seriea", "bundes", "ligue1", "mls", "ligamx", "ucl", "uel",
-    "erediv", "liga2", "lig2fr", "bund2", "serieb", "porto", "scotpr", "uecl",
+    "erediv", "liga2", "lig2fr", "bund2", "serieb", "porto",
     "champ", "jleag", "j2", "aleag", "braA", "braB", "kleag", "china",
     "turk", "norw", "denm", "colom", "egypt", "libert", "sudam", "saudi",
 }
@@ -322,12 +330,14 @@ POLY_SERIES_IDS = {
     "braB":   "10973",
     "ligamx": "10290",
     "argA":   "10285",
-    "col":    "10437",
+    "colom":  "10437",  # fixed: was "col" (ESPN key is "colom")
     # Europe fringe
     "turk":   "10292",
     "norw":   "10362",
     "denm":   "10363",
     "saudi":  "10361",
+    "serieb": "10676",  # Italian Serie B (Polymarket catalog key: "itsb")
+    "egypt":  "10969",  # Egyptian Premier League (catalog key: "egy1")
 }
 
 POLY_GAMES_TAG_ID = "100639"

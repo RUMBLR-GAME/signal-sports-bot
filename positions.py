@@ -415,6 +415,19 @@ class PositionManager:
             f"cash=${self.cash:.2f} equity=${self.equity:.2f}"
         )
 
+    async def force_close(self, position_id: str, current_price: float, reason: str = "manual_close") -> Optional[Trade]:
+        """Manually close a position at a given current price.
+        Used by API /close endpoint. Returns the Trade or None if position not found.
+        current_price should be the BID side (what we'd actually sell at).
+        """
+        p = self.positions.get(position_id)
+        if not p or p.status not in ("open", "filled"):
+            return None
+        payout = p.size * current_price
+        result = "EXIT_PROFIT" if payout > p.cost else "EXIT_LOSS"
+        await self._close(p, result, payout, reason)
+        return self.trades[-1] if self.trades else None
+
     # ── Queries ──────────────────────────────────────────────────────────
     def has_position_for(self, cid: str) -> bool:
         return any(p.condition_id == cid for p in self.positions.values() if p.status in ("open", "filled"))

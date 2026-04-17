@@ -27,6 +27,7 @@ from config import (
     EDGE_PRE_GAME_EXIT_MIN, EDGE_STALE_HOURS,
     MIN_MARKET_LIQUIDITY, MIN_DAILY_VOLUME,
     POLY_STALE_QUOTE_SEC, POLY_STALE_PENALTY,
+    MAX_TOTAL_EXPOSURE_PCT, MAX_OPEN_POSITIONS,
 )
 from harvest import _market_is_stale
 
@@ -112,6 +113,23 @@ async def scan_edge(
         seen: set = set()
 
         for odds in odds_list:
+            # Portfolio-wide caps: don't add new positions when we're at exposure limit.
+            open_cost = sum(
+                p.cost for p in positions.positions.values()
+                if p.status in ("open", "filled")
+            )
+            exposure_pct = open_cost / max(positions.starting_bankroll, 1)
+            if exposure_pct >= MAX_TOTAL_EXPOSURE_PCT:
+                logger.debug(
+                    f"EDGE: skipping — exposure {exposure_pct:.0%} >= cap {MAX_TOTAL_EXPOSURE_PCT:.0%}"
+                )
+                return signals, diag
+            if len(positions.positions) >= MAX_OPEN_POSITIONS:
+                logger.debug(
+                    f"EDGE: skipping — {len(positions.positions)} open >= cap {MAX_OPEN_POSITIONS}"
+                )
+                return signals, diag
+
             key = (odds.home_team.lower(), odds.away_team.lower(), odds.commence_time[:10])
             if key in seen:
                 continue
