@@ -122,30 +122,20 @@ async def _get(session: aiohttp.ClientSession, path: str, params: dict) -> Optio
 
 
 async def _fetch_events_for_league(
-    session: aiohttp.ClientSession, sport_api_name: str, league_api_name: str
+    session: aiohttp.ClientSession, league_slug: str, bookmaker: str
 ) -> List[dict]:
     """
-    League name filtering: odds-api.io may or may not accept 'league' param,
-    and the exact name convention isn't documented. We pass it when provided
-    and gracefully degrade if the server ignores it.
+    Fetch UPCOMING events for a league using its slug.
+    `status=pending` excludes already-settled games.
+    `bookmaker=X` restricts to events where our bookmaker has odds.
     """
-    params = {"sport": sport_api_name, "limit": 100}
-    if league_api_name:
-        params["league"] = league_api_name
-    data = await _get(session, "/events", params)
-    if not data:
-        return []
-    return data if isinstance(data, list) else data.get("events", []) or []
-
-
-async def _fetch_all_football_events(
-    session: aiohttp.ClientSession
-) -> List[dict]:
-    """
-    Fetch ALL football events from odds-api.io (single request, unfiltered).
-    We then filter client-side by league name keyword matching.
-    """
-    params = {"sport": "football", "limit": 200}
+    params = {
+        "sport": "football",
+        "league": league_slug,
+        "status": "pending",
+        "bookmaker": bookmaker,
+        "limit": 100,
+    }
     data = await _get(session, "/events", params)
     if not data:
         return []
@@ -253,55 +243,33 @@ def _normalize_event(event: dict, sport_key: str, preferred_books: List[str]) ->
 
 
 # ─── League fetch with caching ─────────────────────────────────────────────
-# Global football events cache (shared across all league filters)
-_EVENTS_CACHE: Dict[str, tuple] = {}
-
-
-async def _get_all_football_events_cached(session: aiohttp.ClientSession) -> List[dict]:
-    now = time.time()
-    cached = _EVENTS_CACHE.get("football")
-    if cached and (now - cached[0]) < CACHE_TTL_SEC:
-        return cached[1]
-    events = await _fetch_all_football_events(session)
-    if events:
-        _EVENTS_CACHE["football"] = (now, events)
-    elif cached:
-        return cached[1]
-    return events
-
-
-def _event_matches_league(event: dict, match_keywords: List[str]) -> bool:
-    """Check if the event's league field matches any keyword."""
-    league = (event.get("league") or event.get("leagueName") or "").lower()
-    if not league:
-        return False
-    return any(kw.lower() in league for kw in match_keywords)
-
-
 async def _fetch_league_cached(
     session: aiohttp.ClientSession,
     sport_key: str,
-    match_keywords: List[str],
+    league_slug: str,
     bookmakers: List[str],
 ) -> List[GameOdds]:
+    """Per-league TTL-cached fetch. Uses slug + status=pending to get upcoming games."""
     now = time.time()
     cached = _ODDS_CACHE.get(sport_key)
     if cached and (now - cached[0]) < CACHE_TTL_SEC:
+        logger.info(f"odds_api[{sport_key}]: cache hit, {len(cached[1])} odds")
         return cached[1]
 
-    # Pull all football events once (shared across league filters)
-    all_events = await _get_all_football_events_cached(session)
-    if not all_events:
+    # Use first bookmaker for the event filter (the /events endpoint takes 1 bookmaker)
+    primary_book = bookmakers[0] if bookmakers else "Bet365"
+    events = await _fetch_events_for_league(session, league_slug, primary_book)
+    logger.info(f"odds_api[{sport_key}]: /events returned {len(events)} raw events (slug={league_slug})")
+    if not events:
         if cached:
             return cached[1]
+        _ODDS_CACHE[sport_key] = (now, [])
         return []
 
-    # Filter to this league + next 48h
+    # Only look at events in next 48h (status=pending + further cutoff)
     cutoff = time.time() + 48 * 3600
     upcoming = []
-    for ev in all_events:
-        if not _event_matches_league(ev, match_keywords):
-            continue
+    for ev in events:
         try:
             d = ev.get("date") or ev.get("startsAt") or ""
             if not d:
@@ -309,8 +277,9 @@ async def _fetch_league_cached(
             ts = datetime.fromisoformat(d.replace("Z", "+00:00")).timestamp()
             if ts > time.time() and ts < cutoff:
                 upcoming.append(ev)
-        except Exception:
-            pass
+        except Exception as ex:
+            logger.debug(f"odds_api[{sport_key}]: date parse err: {ex}")
+    logger.info(f"odds_api[{sport_key}]: {len(upcoming)} events within 48h window")
     if not upcoming:
         _ODDS_CACHE[sport_key] = (now, [])
         return []
@@ -321,13 +290,45 @@ async def _fetch_league_cached(
         chunk = upcoming[i : i + 10]
         event_ids = [e.get("id") for e in chunk if e.get("id") is not None]
         odds_batch = await _fetch_odds_batch(session, event_ids, bookmakers)
+        logger.info(f"odds_api[{sport_key}]: /odds/multi for {len(event_ids)} IDs returned {len(odds_batch)} events with odds")
+        normalized_count = 0
+        rejected_reasons = {"no_home_away": 0, "no_bookmakers": 0, "no_matching_book": 0, "no_ml": 0, "bad_probs": 0}
         for ev in odds_batch:
+            # Manual replication of _normalize_event's rejection path for debug
+            if not (ev.get("home") and ev.get("away")):
+                rejected_reasons["no_home_away"] += 1
+                continue
+            bms = ev.get("bookmakers") or {}
+            if not bms:
+                rejected_reasons["no_bookmakers"] += 1
+                continue
+            # Case-insensitive match
+            book_keys_lower = {k.lower(): k for k in bms.keys()}
+            found_book = None
+            for book_pref in bookmakers:
+                if book_pref.lower() in book_keys_lower:
+                    found_book = book_keys_lower[book_pref.lower()]
+                    break
+            if not found_book:
+                rejected_reasons["no_matching_book"] += 1
+                logger.info(f"  event {ev.get('id')}: bookmakers present = {list(bms.keys())} (wanted {bookmakers})")
+                continue
+            ml = _extract_ml_odds(bms[found_book])
+            if not ml:
+                rejected_reasons["no_ml"] += 1
+                continue
+            # Let _normalize_event do the actual work
             go = _normalize_event(ev, sport_key, bookmakers)
             if go:
                 all_game_odds.append(go)
+                normalized_count += 1
+            else:
+                rejected_reasons["bad_probs"] += 1
+        logger.info(f"odds_api[{sport_key}]: normalized {normalized_count}/{len(odds_batch)} — rejections: {rejected_reasons}")
 
     if all_game_odds:
         _ODDS_CACHE[sport_key] = (now, all_game_odds)
+    logger.info(f"odds_api[{sport_key}]: final {len(all_game_odds)} GameOdds")
     return all_game_odds
 
 
@@ -337,8 +338,8 @@ async def fetch_all_soccer(session: aiohttp.ClientSession) -> List[GameOdds]:
         return []
     bookmakers = ODDS_API_BOOKMAKERS or ["Bet365", "DraftKings"]
     tasks = [
-        _fetch_league_cached(session, sport_key, match_keywords, bookmakers)
-        for sport_key, match_keywords in ODDS_API_LEAGUE_MAP.items()
+        _fetch_league_cached(session, sport_key, league_slug, bookmakers)
+        for sport_key, league_slug in ODDS_API_LEAGUE_MAP.items()
     ]
     try:
         results = await asyncio.wait_for(
