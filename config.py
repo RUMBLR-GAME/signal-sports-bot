@@ -187,11 +187,10 @@ ESPN_SPORTS = {
     "bund2":  {"league": "ger.2",  **_S},
     "serieb": {"league": "ita.2",  **_S},
     "porto":  {"league": "por.1",  **_S},
-    # NOTE: Scottish Premiership and UEFA Conference League disabled — not listed
-    # on Polymarket (verified against /sports catalog 2026-04-18, 179 series, none match).
-    # ESPN has the data but bot can't trade them, so we skip fetching to save cycles.
+    "uecl":   {"league": "uefa.europa.conf", **_S},
+    # NOTE: Scottish Premiership disabled — not listed on Polymarket (179 series
+    # catalog checked 2026-04-18). ESPN has the data but bot can't trade it.
     # "scotpr": {"league": "sco.1",  **_S},
-    # "uecl":   {"league": "uefa.europa.conf", **_S},
     # Tier 3 — Sleeping Lion
     "champ":  {"league": "eng.2",  **_S},
     "jleag":  {"league": "jpn.1",  **_S},
@@ -204,8 +203,12 @@ ESPN_SPORTS = {
     "turk":   {"league": "tur.1",  **_S},
     "norw":   {"league": "nor.1",  **_S},
     "denm":   {"league": "den.1",  **_S},
-    "colom":  {"league": "col.1",  **_S},
     "egypt":  {"league": "egy.1",  **_S},
+    "argA":   {"league": "arg.1",  **_S},
+    # NOTE: Colombian league disabled — Polymarket catalog's "col" series (10437)
+    # actually contains UEFA Conference League events, not Colombian league.
+    # ESPN has col.1 data but bot can't trade it.
+    # "colom":  {"league": "col.1",  **_S},
     "libert": {"league": "conmebol.libertadores", **_S},
     "sudam":  {"league": "conmebol.sudamericana", **_S},
     "saudi":  {"league": "sau.1",  **_S},
@@ -284,9 +287,9 @@ WIN_THRESHOLDS = {
 
 SOCCER_SPORTS = {
     "epl", "liga", "seriea", "bundes", "ligue1", "mls", "ligamx", "ucl", "uel",
-    "erediv", "liga2", "lig2fr", "bund2", "serieb", "porto",
+    "erediv", "liga2", "lig2fr", "bund2", "serieb", "porto", "uecl",
     "champ", "jleag", "j2", "aleag", "braA", "braB", "kleag", "china",
-    "turk", "norw", "denm", "colom", "egypt", "libert", "sudam", "saudi",
+    "turk", "norw", "denm", "egypt", "argA", "libert", "sudam", "saudi",
 }
 
 # ─── POLYMARKET SERIES IDs ───────────────────────────────────────────────────
@@ -330,13 +333,13 @@ POLY_SERIES_IDS = {
     "braB":   "10973",
     "ligamx": "10290",
     "argA":   "10285",
-    "colom":  "10437",  # fixed: was "col" (ESPN key is "colom")
+    "uecl":   "10437",  # Europa Conference League (catalog key: "col" — Polymarket miscategorized)
     # Europe fringe
     "turk":   "10292",
     "norw":   "10362",
     "denm":   "10363",
     "saudi":  "10361",
-    "serieb": "10676",  # Italian Serie B (Polymarket catalog key: "itsb")
+    "serieb": "10676",  # Italian Serie B (catalog key: "itsb")
     "egypt":  "10969",  # Egyptian Premier League (catalog key: "egy1")
 }
 
