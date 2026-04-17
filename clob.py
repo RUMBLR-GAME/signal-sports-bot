@@ -337,14 +337,51 @@ class ClobInterface:
 
 
 def parse_market_tokens(market: dict) -> Optional[dict]:
-    """Parse a Gamma event → dict with outcomes, token_ids, prices."""
+    """Parse a Gamma event → dict with outcomes, token_ids, prices.
+    Events contain multiple child markets (moneyline, spread, totals, etc).
+    We select the MONEYLINE market (team-name outcomes) and reject derivatives.
+    """
     try:
         markets = market.get("markets", [])
         if not markets:
             return None
-        m = markets[0]
-        if m.get("closed"):
+
+        # Derivative market indicators to reject. If any appear in the question,
+        # skip this child market and look for the plain moneyline.
+        # These match spread markets, totals, prop markets, etc.
+        DERIV_PATTERNS = (
+            "spread:", "spread ", "(-", "(+",
+            "total:", "totals:", "over/under", "over ", "under ",
+            "handicap", "to score", "both teams", "clean sheet",
+            "first goal", "correct score", "half-time", "halftime",
+            "draw no bet", "double chance", "dnb", "btts",
+        )
+
+        # Prefer a market whose question looks like "TeamA vs. TeamB"
+        # (or similar moneyline phrasing).
+        selected = None
+        for m in markets:
+            if m.get("closed"):
+                continue
+            q = (m.get("question") or "").lower()
+            if any(pat in q for pat in DERIV_PATTERNS):
+                continue
+            # Must have team-name outcomes (two distinct non-numeric strings)
+            raw_out = m.get("outcomes", "[]")
+            outs = json.loads(raw_out) if isinstance(raw_out, str) else raw_out
+            if len(outs) < 2:
+                continue
+            # Reject markets whose outcomes look like "Yes/No" (prop markets)
+            # or numeric ranges (totals markets).
+            low_outs = [str(o).lower() for o in outs[:2]]
+            if any(o in ("yes", "no", "over", "under") for o in low_outs):
+                continue
+            selected = m
+            break
+
+        if selected is None:
             return None
+        m = selected
 
         outcomes = m.get("outcomes", "[]")
         outcomes = json.loads(outcomes) if isinstance(outcomes, str) else outcomes
