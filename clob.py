@@ -337,77 +337,169 @@ class ClobInterface:
 
 
 def parse_market_tokens(market: dict) -> Optional[dict]:
-    """Parse a Gamma event → dict with outcomes, token_ids, prices.
-    Events contain multiple child markets (moneyline, spread, totals, etc).
-    We select the MONEYLINE market (team-name outcomes) and reject derivatives.
+    """Parse a Gamma event -> normalized dict with 2 outcomes/tokens/prices.
+
+    Polymarket has TWO market structures we must handle:
+
+    CLASSIC (MLB, NBA, NFL, tennis, etc):
+      One child market with outcomes=["Team A","Team B"] and two tokens.
+
+    SOCCER (EPL, Championship, La Liga 2, Portuguese, etc):
+      Three separate Yes/No child markets per event:
+        M1 "Will {Home} win?"  outcomes=[Yes, No]
+        M2 "Will the match end in a draw?"  outcomes=[Yes, No]
+        M3 "Will {Away} win?"  outcomes=[Yes, No]
+      We synthesize a 2-outcome "moneyline" from the YES sides of M1 + M3.
+      This lets downstream matchers treat both structures identically.
+
+    Derivative markets (spread, totals, BTTS, correct score, handicap) are
+    rejected in both structures.
     """
     try:
-        markets = market.get("markets", [])
-        if not markets:
+        child_markets = market.get("markets", [])
+        if not child_markets:
             return None
 
-        # Derivative market indicators to reject. If any appear in the question,
-        # skip this child market and look for the plain moneyline.
-        # These match spread markets, totals, prop markets, etc.
+        # Question patterns that indicate a derivative — reject these.
         DERIV_PATTERNS = (
             "spread:", "spread ", "(-", "(+",
-            "total:", "totals:", "over/under", "over ", "under ",
+            "total:", "totals:", "over/under", " over ", " under ",
             "handicap", "to score", "both teams", "clean sheet",
             "first goal", "correct score", "half-time", "halftime",
             "draw no bet", "double chance", "dnb", "btts",
+            "corners", "bookings", "cards", "penalty",
         )
 
-        # Prefer a market whose question looks like "TeamA vs. TeamB"
-        # (or similar moneyline phrasing).
-        selected = None
-        for m in markets:
+        def is_derivative(q: str) -> bool:
+            ql = (q or "").lower()
+            return any(p in ql for p in DERIV_PATTERNS)
+
+        def load_outcomes(m: dict) -> list:
+            raw = m.get("outcomes", "[]")
+            try:
+                return json.loads(raw) if isinstance(raw, str) else raw
+            except Exception:
+                return []
+
+        def load_tokens(m: dict) -> list:
+            raw = m.get("clobTokenIds", "[]")
+            try:
+                return json.loads(raw) if isinstance(raw, str) else raw
+            except Exception:
+                return []
+
+        def load_prices(m: dict) -> list:
+            raw = m.get("outcomePrices", "[]")
+            try:
+                parsed = json.loads(raw) if isinstance(raw, str) else raw
+                return [float(p) for p in parsed]
+            except Exception:
+                return []
+
+        event_title = market.get("title", "")
+
+        # ─── Try CLASSIC structure first ──────────────────────────────────
+        for m in child_markets:
             if m.get("closed"):
                 continue
-            q = (m.get("question") or "").lower()
-            if any(pat in q for pat in DERIV_PATTERNS):
+            q = m.get("question") or ""
+            if is_derivative(q):
                 continue
-            # Must have team-name outcomes (two distinct non-numeric strings)
-            raw_out = m.get("outcomes", "[]")
-            outs = json.loads(raw_out) if isinstance(raw_out, str) else raw_out
-            if len(outs) < 2:
+            outs = load_outcomes(m)
+            if len(outs) != 2:
                 continue
-            # Reject markets whose outcomes look like "Yes/No" (prop markets)
-            # or numeric ranges (totals markets).
-            low_outs = [str(o).lower() for o in outs[:2]]
-            if any(o in ("yes", "no", "over", "under") for o in low_outs):
+            # Classic moneyline: outcomes are team names, NOT yes/no
+            low = [str(o).lower() for o in outs]
+            if any(o in ("yes", "no") for o in low):
                 continue
-            selected = m
-            break
+            toks = load_tokens(m)
+            prices = load_prices(m)
+            if len(toks) < 2 or len(prices) < 2:
+                continue
+            return {
+                "condition_id": m.get("conditionId", ""),
+                "question": q or event_title,
+                "outcomes": list(outs[:2]),
+                "token_ids": list(toks[:2]),
+                "prices": list(prices[:2]),
+                "end_date": m.get("endDate", ""),
+                "volume": float(market.get("volume", 0) or 0),
+                "liquidity": float(market.get("liquidity", 0) or 0),
+                "last_trade_time": m.get("lastTradeTime") or m.get("last_trade_time"),
+                "_structure": "classic",
+            }
 
-        if selected is None:
-            return None
-        m = selected
+        # ─── Try SOCCER (three-way Yes/No) structure ──────────────────────
+        # Find "Will X win?" markets — skip "draw" and skip derivatives.
+        team_win_markets = []
+        for m in child_markets:
+            if m.get("closed"):
+                continue
+            q = (m.get("question") or "").strip()
+            ql = q.lower()
+            if is_derivative(q):
+                continue
+            # Want a "Will <team> win" phrasing. Reject the draw market explicitly.
+            if "draw" in ql:
+                continue
+            if "will " not in ql or " win" not in ql:
+                continue
+            outs = load_outcomes(m)
+            if len(outs) != 2:
+                continue
+            # Outcomes must be Yes/No
+            low = [str(o).lower() for o in outs]
+            if low[0] != "yes" or low[1] != "no":
+                continue
+            toks = load_tokens(m)
+            prices = load_prices(m)
+            if len(toks) < 2 or len(prices) < 2:
+                continue
+            # Extract team name from question: "Will <Team> win on ...?" or "Will <Team> win?"
+            # Strip the "Will " prefix and " win..." suffix.
+            team = q
+            if team.lower().startswith("will "):
+                team = team[5:]
+            # Remove trailing "win..." portion
+            team_lower = team.lower()
+            win_idx = team_lower.find(" win")
+            if win_idx > 0:
+                team = team[:win_idx]
+            team = team.strip().rstrip("?").strip()
+            if not team:
+                continue
+            team_win_markets.append({
+                "team": team,
+                "yes_token": toks[0],
+                "yes_price": prices[0],
+                "condition_id": m.get("conditionId", ""),
+                "last_trade_time": m.get("lastTradeTime") or m.get("last_trade_time"),
+                "question": q,
+            })
 
-        outcomes = m.get("outcomes", "[]")
-        outcomes = json.loads(outcomes) if isinstance(outcomes, str) else outcomes
-        tokens = m.get("clobTokenIds", "[]")
-        tokens = json.loads(tokens) if isinstance(tokens, str) else tokens
-        prices = m.get("outcomePrices", "[]")
-        prices = json.loads(prices) if isinstance(prices, str) else prices
-        prices = [float(p) for p in prices]
+        if len(team_win_markets) >= 2:
+            # Take the first two (should be exactly Home and Away — soccer events
+            # have exactly two "team win" markets plus one draw market).
+            a, b = team_win_markets[0], team_win_markets[1]
+            return {
+                # Use first team's condition_id as the "primary" — has_position_for_game
+                # uses team names anyway, so duplicate-bet prevention still works.
+                "condition_id": a["condition_id"],
+                "question": event_title or f"{a['team']} vs. {b['team']}",
+                "outcomes": [a["team"], b["team"]],
+                "token_ids": [a["yes_token"], b["yes_token"]],
+                "prices": [a["yes_price"], b["yes_price"]],
+                "end_date": "",
+                "volume": float(market.get("volume", 0) or 0),
+                "liquidity": float(market.get("liquidity", 0) or 0),
+                "last_trade_time": a["last_trade_time"],
+                "_structure": "soccer_3way",
+                # Expose per-team condition_ids so downstream code can track
+                # the actual market being traded, not just the "primary".
+                "_condition_ids": [a["condition_id"], b["condition_id"]],
+            }
 
-        if len(outcomes) < 2 or len(tokens) < 2:
-            return None
-
-        # Last trade time (for staleness check)
-        last_trade = m.get("lastTradeTime") or m.get("last_trade_time")
-
-        return {
-            "condition_id": m.get("conditionId", ""),
-            "question": m.get("question", market.get("title", "")),
-            "outcomes": outcomes,
-            "token_ids": tokens,
-            "prices": prices,
-            "end_date": m.get("endDate", ""),
-            "volume": float(market.get("volume", 0) or 0),
-            "liquidity": float(market.get("liquidity", 0) or 0),
-            "last_trade_time": last_trade,
-        }
+        return None
     except Exception as e:
         logger.debug(f"parse_market_tokens: {e}")
         return None
