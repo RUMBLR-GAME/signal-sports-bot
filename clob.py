@@ -92,6 +92,26 @@ class ClobInterface:
             logger.debug(f"get_price {token_id[-8:]} {side}: {e}")
             return None
 
+    async def get_price_http(self, token_id: str, side: str = "BUY") -> Optional[float]:
+        """
+        Pure-HTTP price fetch — works without py_clob_client initialized.
+        Used as a live-price fallback for dashboard enrichment in paper mode.
+        """
+        try:
+            session = await self._get_session()
+            url = f"{CLOB_HOST}/price"
+            params = {"token_id": token_id, "side": side}
+            async with session.get(url, params=params, timeout=5) as r:
+                if r.status != 200:
+                    return None
+                data = await r.json()
+                if "price" in data:
+                    return float(data["price"])
+                return None
+        except Exception as e:
+            logger.debug(f"get_price_http {token_id[-8:]} {side}: {e}")
+            return None
+
     async def get_midpoint(self, token_id: str) -> Optional[float]:
         if not self._client:
             return None

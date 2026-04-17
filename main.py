@@ -214,15 +214,16 @@ async def enrich_live_games(clob: ClobInterface, bot_state: dict, market_ws: Mar
 
             # If WS has no data yet (not subscribed long enough, or thin book),
             # fetch live from CLOB REST. Critical for live games where Gamma is stale.
+            # Use HTTP-only method (works in paper mode without py_clob_client auth).
             if home_price is None:
                 try:
-                    home_price = await clob.get_price(home_tok, "BUY")
+                    home_price = await clob.get_price_http(home_tok, "BUY")
                 except Exception as e:
                     logger.debug(f"live price fetch home: {e}")
                     home_price = None
             if away_price is None:
                 try:
-                    away_price = await clob.get_price(away_tok, "BUY")
+                    away_price = await clob.get_price_http(away_tok, "BUY")
                 except Exception as e:
                     logger.debug(f"live price fetch away: {e}")
                     away_price = None
