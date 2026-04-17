@@ -117,13 +117,16 @@ EDGE_STOP_LOSS = _flt("EDGE_STOP_LOSS", 0.05)
 EDGE_PRE_GAME_EXIT_MIN = _int("EDGE_PRE_GAME_EXIT_MIN", 30)
 EDGE_STALE_HOURS = _flt("EDGE_STALE_HOURS", 48)
 
-# ─── ODDS API (flag-gated soccer) ────────────────────────────────────────────
+# ─── ODDS API (odds-api.io — flag-gated) ─────────────────────────────────────
+# Free tier: 100 req/hour, 2 bookmakers chosen in user dashboard.
+# /odds/multi batches 10 events per request — generous budget.
 ODDS_API_KEY = os.getenv("ODDS_API_KEY", "").strip()
 ODDS_API_ENABLED = _bool("ODDS_API_ENABLED", False) and bool(ODDS_API_KEY)
-ODDS_API_BASE = "https://api.the-odds-api.com/v4"
-ODDS_API_REGIONS = os.getenv("ODDS_API_REGIONS", "us,uk,eu,au")
-# Sharp books preferred for de-vigging
-ODDS_API_SHARP_BOOKS = ["pinnacle", "betfair_ex_uk", "betfair", "bet365", "williamhill"]
+ODDS_API_BASE = "https://api.odds-api.io/v3"
+# User's selected bookmakers in their odds-api.io dashboard. Free tier = 2.
+# Preference order: first match wins. Bet365 and DraftKings are the default.
+_bookmaker_csv = os.getenv("ODDS_API_BOOKMAKERS", "Bet365,DraftKings").strip()
+ODDS_API_BOOKMAKERS = [b.strip() for b in _bookmaker_csv.split(",") if b.strip()]
 
 # ─── STALE MARKET PENALTY ────────────────────────────────────────────────────
 # If Polymarket quote hasn't traded in this long, halve effective confidence.
@@ -203,33 +206,45 @@ ESPN_SPORTS = {
 # Sports where ESPN embeds FanDuel/ESPN BET odds
 ESPN_ODDS_SPORTS = {"nba", "wnba", "nhl", "mlb", "nfl", "ncaab", "ncaaf", "mls"}
 
-# Map ESPN sport → Odds API sport_key (for soccer fallback)
-ODDS_API_SPORT_MAP = {
-    "epl":    "soccer_epl",
-    "liga":   "soccer_spain_la_liga",
-    "seriea": "soccer_italy_serie_a",
-    "bundes": "soccer_germany_bundesliga",
-    "ligue1": "soccer_france_ligue_one",
-    "ucl":    "soccer_uefa_champs_league",
-    "uel":    "soccer_uefa_europa_league",
-    "champ":  "soccer_efl_champ",
-    "jleag":  "soccer_japan_j_league",
-    "j2":     "soccer_japan_j_league_2",
-    "aleag":  "soccer_australia_aleague",
-    "braA":   "soccer_brazil_campeonato",
-    "braB":   "soccer_brazil_serie_b",
-    "kleag":  "soccer_korea_kleague1",
-    "china":  "soccer_china_superleague",
-    "norw":   "soccer_norway_eliteserien",
-    "denm":   "soccer_denmark_superliga",
-    "ligamx": "soccer_mexico_ligamx",
-    "turk":   "soccer_turkey_super_league",
-    "erediv": "soccer_netherlands_eredivisie",
-    "porto":  "soccer_portugal_primeira_liga",
-    "libert": "soccer_conmebol_copa_libertadores",
-    "sudam":  "soccer_conmebol_copa_sudamericana",
-    "saudi":  "soccer_saudi_pro_league",
+# Map our internal sport key → list of keywords that match odds-api.io's `league` field.
+# We filter client-side since odds-api.io's league name conventions aren't documented.
+# Multiple keywords allow fuzzy matching (e.g. "J2" matches "J2 League", "Japan J2", etc).
+_ODDS_API_FULL_MAP = {
+    "epl":    ["Premier League", "English Premier"],
+    "liga":   ["La Liga", "LaLiga", "Spanish"],
+    "seriea": ["Serie A"],
+    "bundes": ["Bundesliga"],
+    "ligue1": ["Ligue 1"],
+    "ucl":    ["Champions League", "UEFA Champions"],
+    "uel":    ["Europa League"],
+    "champ":  ["Championship", "EFL Championship"],
+    "jleag":  ["J1 League", "J-League"],
+    "j2":     ["J2 League", "J.League 2"],
+    "aleag":  ["A-League", "A League"],
+    "braA":   ["Brasileirão", "Brazilian Serie A", "Brasileirao"],
+    "braB":   ["Brazilian Serie B", "Brasileirão B"],
+    "kleag":  ["K League"],
+    "china":  ["Chinese Super", "CSL"],
+    "norw":   ["Eliteserien"],
+    "denm":   ["Superligaen", "Danish Super"],
+    "ligamx": ["Liga MX"],
+    "turk":   ["Süper Lig", "Super Lig", "Turkish"],
+    "erediv": ["Eredivisie"],
+    "porto":  ["Primeira Liga", "Portuguese"],
+    "libert": ["Copa Libertadores"],
+    "sudam":  ["Copa Sudamericana"],
+    "saudi":  ["Saudi Pro", "Saudi League"],
 }
+
+# Default budget-safe set: the "sleeping lion" leagues + Championship for Saturday volume.
+# Override with ODDS_API_LEAGUES env var (comma-separated sport keys, or "all").
+_DEFAULT_ODDS_LEAGUES = "j2,aleag,champ,braA"
+_LEAGUE_FILTER = os.getenv("ODDS_API_LEAGUES", _DEFAULT_ODDS_LEAGUES).strip()
+if _LEAGUE_FILTER.lower() == "all":
+    ODDS_API_LEAGUE_MAP = _ODDS_API_FULL_MAP
+else:
+    _wanted = {s.strip() for s in _LEAGUE_FILTER.split(",") if s.strip()}
+    ODDS_API_LEAGUE_MAP = {k: v for k, v in _ODDS_API_FULL_MAP.items() if k in _wanted}
 
 # ─── BLOWOUT THRESHOLDS ──────────────────────────────────────────────────────
 # NBA tightened to account for pace-and-space era ("20 is the new 12")
