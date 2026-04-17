@@ -300,7 +300,9 @@ class ClobInterface:
         live_ids = set()
         if isinstance(data, list):
             for s in data:
-                sid = s.get("id") or s.get("seriesId")
+                # Polymarket /sports returns: {id: <row>, sport: "nba", series: "10345"}
+                # We want the `series` field, not `id` (which is a row number 1..183).
+                sid = s.get("series") or s.get("seriesId")
                 if sid is not None:
                     live_ids.add(str(sid))
 
