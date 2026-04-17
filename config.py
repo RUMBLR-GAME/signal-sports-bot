@@ -232,20 +232,52 @@ SOCCER_SPORTS = {
 }
 
 # ─── POLYMARKET SERIES IDs ───────────────────────────────────────────────────
+# Verified against live /sports endpoint 2026-04-17.
 POLY_SERIES_IDS = {
-    "nba": "10345", "nhl": "10346", "mlb": "3",
-    "nfl": "10187", "wnba": "10105",
-    "ncaab": "10470", "ncaaf": "10210",
-    "epl": "10188", "liga": "10193", "seriea": "10203",
-    "bundes": "10194", "ligue1": "10195",
-    "ucl": "10204", "uel": "10209",
-    "mls": "10189", "ligamx": "10290",
-    "erediv": "10286", "porto": "10330", "uecl": "10437",
-    "champ": "10230", "jleag": "10360", "j2": "10443",
-    "aleag": "10438", "braA": "10359", "kleag": "10444",
-    "china": "10439", "turk": "10292", "norw": "10362",
-    "denm": "10363", "saudi": "10361",
-    "libert": "10289", "sudam": "10291",
+    # US major
+    "nba":    "10345",
+    "wnba":   "10105",
+    "nfl":    "10187",
+    "nhl":    "10346",
+    "mlb":    "3",
+    "ncaab":  "39",
+    "ncaaf":  "10210",
+    "mls":    "10189",
+    # European top flights
+    "epl":    "10188",
+    "liga":   "10193",
+    "seriea": "10287",
+    "bundes": "10194",
+    "ligue1": "10195",
+    "erediv": "10286",
+    "porto":  "10330",
+    # European second tiers (sleeping lion)
+    "champ":  "10355",   # English Championship
+    "liga2":  "10672",
+    "bund2":  "10670",
+    "lig2fr": "10675",
+    # European cups
+    "ucl":    "10204",
+    "uel":    "10209",
+    # Asia / Oceania
+    "jleag":  "10360",   # J1
+    "j2":     "10443",   # J2 — prime target
+    "kleag":  "10444",
+    "china":  "10439",
+    "aleag":  "10438",
+    # Latin America
+    "libert": "10289",
+    "sudam":  "10291",
+    "braA":   "10359",
+    "braB":   "10973",
+    "ligamx": "10290",
+    "argA":   "10285",
+    "col":    "10437",
+    # Europe fringe
+    "turk":   "10292",
+    "norw":   "10362",
+    "denm":   "10363",
+    "saudi":  "10361",
 }
 
 POLY_GAMES_TAG_ID = "100639"
