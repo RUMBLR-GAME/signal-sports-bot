@@ -379,6 +379,13 @@ async def bot_loop(clob, positions, bot_state, sports_ws: SportsWS, market_ws: M
 
                     sports_with = sorted({o.sport for o in all_odds})
                     bot_state["sports_with_odds"] = sports_with
+                    bot_state["odds_source_counts"] = {
+                        "espn_odds": len(espn_odds),
+                        "oddsapi_odds": len(oa_odds),
+                        "total": len(all_odds),
+                        "espn_sports": sorted({o.sport for o in espn_odds}),
+                        "oddsapi_sports": sorted({o.sport for o in oa_odds}),
+                    }
 
                     if paused or not circuit_ok:
                         _log_event(bot_state, "Paused", engine="edge", level="warning")
