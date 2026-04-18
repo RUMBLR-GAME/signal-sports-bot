@@ -63,6 +63,9 @@ class Position:
     current_price: Optional[float] = None
     last_mark_at: Optional[float] = None
     partial_exits: int = 0
+    # Bookmaker context (edge trades only — shows sharp-book pricing vs Polymarket)
+    provider: str = ""           # e.g. "Bet365", "DraftKings"
+    moneyline: int = 0           # American moneyline odds at entry (e.g. +150, -120)
 
 
 @dataclass

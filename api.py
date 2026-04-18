@@ -20,6 +20,20 @@ from clob import ClobInterface
 logger = logging.getLogger("api")
 
 
+def _ml_to_prob(ml):
+    """Convert American moneyline odds to implied probability (no de-vig)."""
+    if ml is None or ml == 0:
+        return None
+    try:
+        ml = int(ml)
+    except (TypeError, ValueError):
+        return None
+    if ml > 0:
+        return round(100.0 / (ml + 100.0), 4)
+    else:
+        return round(abs(ml) / (abs(ml) + 100.0), 4)
+
+
 def _cors_headers(req):
     origin = req.headers.get("Origin", "")
     allowed = origin if any(a.strip() and a.strip() in origin for a in CORS_ORIGINS) else "*"
@@ -72,6 +86,9 @@ def create_api(positions: PositionManager, bot_state: dict, clob: ClobInterface 
                     "partial_exits": p.partial_exits,
                     "score_line": p.score_line,
                     "token_id": p.token_id,
+                    "provider": p.provider,
+                    "moneyline": p.moneyline,
+                    "book_prob": _ml_to_prob(p.moneyline),
                 })
 
             history = []

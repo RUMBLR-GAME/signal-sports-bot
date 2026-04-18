@@ -89,6 +89,8 @@ async def execute_signal(signal, clob: ClobInterface, positions: PositionManager
         game_start_time=getattr(signal, "commence_time", ""),
         score_line=getattr(signal, "score_line", ""),
         espn_id=getattr(signal, "espn_id", ""),
+        provider=getattr(signal, "provider", ""),
+        moneyline=getattr(signal, "moneyline", 0),
     )
     if PAPER_MODE:
         pos.fill_price = price
