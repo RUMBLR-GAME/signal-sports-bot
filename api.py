@@ -135,6 +135,10 @@ def create_api(positions: PositionManager, bot_state: dict, clob: ClobInterface 
                     # Engine state
                     "last_harvest_scan": bot_state.get("last_harvest_scan"),
                     "last_edge_scan": bot_state.get("last_edge_scan"),
+                    "last_edge_exit_run": bot_state.get("last_edge_exit_run", 0),
+                    "edge_exit_runs": bot_state.get("edge_exit_runs", 0),
+                    "last_edge_exit_ok": bot_state.get("last_edge_exit_ok", 0),
+                    "last_edge_exit_err": bot_state.get("last_edge_exit_err"),
                     "last_resolve_check": bot_state.get("last_resolve_check"),
                     "last_ws_sports_msg": bot_state.get("last_ws_sports_msg"),
                     "scan_count": bot_state.get("scan_count", 0),

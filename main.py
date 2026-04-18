@@ -399,9 +399,13 @@ async def bot_loop(clob, positions, bot_state, sports_ws: SportsWS, market_ws: M
             # EDGE exit (every 30s)
             if EDGE_ENABLED and now - last["edge_exit"] >= EDGE_EXIT_INTERVAL:
                 last["edge_exit"] = now
+                bot_state["last_edge_exit_run"] = now
+                bot_state["edge_exit_runs"] = bot_state.get("edge_exit_runs", 0) + 1
                 try:
                     await check_edge_exits(clob, positions)
+                    bot_state["last_edge_exit_ok"] = now
                 except Exception as e:
+                    bot_state["last_edge_exit_err"] = str(e)[:200]
                     logger.error(f"edge exit: {e}", exc_info=True)
 
             # HARVEST partials (every 60s)
