@@ -423,6 +423,20 @@ def parse_market_tokens(market: dict) -> Optional[dict]:
                 return []
 
         event_title = market.get("title", "")
+        title_lower = event_title.lower()
+
+        # REJECT events whose title indicates they ARE derivatives overall.
+        # Polymarket lists "Team A vs. Team B - More Markets" (totals O/U) and
+        # "Team A vs. Team B - Exact Score" (goalscorer markets) as separate
+        # events alongside the real moneyline. We want ONLY the moneyline event.
+        DERIV_TITLE_SUFFIXES = (
+            "- more markets", "- exact score", "- goalscorer",
+            "- total goals", "- total points", "- spread",
+            "- first half", "- 1st half", "- 2nd half",
+            "- first period", "- first quarter", "- half time",
+        )
+        if any(suf in title_lower for suf in DERIV_TITLE_SUFFIXES):
+            return None
 
         # ─── Try CLASSIC structure first ──────────────────────────────────
         for m in child_markets:
@@ -434,9 +448,12 @@ def parse_market_tokens(market: dict) -> Optional[dict]:
             outs = load_outcomes(m)
             if len(outs) != 2:
                 continue
-            # Classic moneyline: outcomes are team names, NOT yes/no
+            # Classic moneyline: outcomes are team names.
+            # Reject yes/no (soccer 3-way child), over/under (totals),
+            # under/over, draw (should be in a separate child).
             low = [str(o).lower() for o in outs]
-            if any(o in ("yes", "no") for o in low):
+            NON_TEAM_OUTCOMES = {"yes", "no", "over", "under", "draw", "tie"}
+            if any(o in NON_TEAM_OUTCOMES for o in low):
                 continue
             toks = load_tokens(m)
             prices = load_prices(m)
