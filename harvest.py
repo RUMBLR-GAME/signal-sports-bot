@@ -23,7 +23,7 @@ from config import (
     HARVEST_MIN_CONFIDENCE, HARVEST_MAX_PRICE, HARVEST_MIN_PRICE,
     HARVEST_MIN_EDGE, MIN_MARKET_LIQUIDITY,
     POLY_STALE_QUOTE_SEC, POLY_STALE_PENALTY,
-    MAX_TOTAL_EXPOSURE_PCT, MAX_OPEN_POSITIONS,
+    MAX_TOTAL_EXPOSURE_PCT, MAX_OPEN_POSITIONS, STARTING_BANKROLL,
 )
 
 logger = logging.getLogger("harvest")
@@ -81,7 +81,7 @@ async def scan_harvest(
             p.cost for p in positions.positions.values()
             if p.status in ("open", "filled")
         )
-        exposure_pct = open_cost / max(positions.starting_bankroll, 1)
+        exposure_pct = open_cost / max(STARTING_BANKROLL, 1)
         if exposure_pct >= MAX_TOTAL_EXPOSURE_PCT:
             diag.append({
                 "sport": game.sport, "leader": game.leader_abbrev, "lead": game.lead,

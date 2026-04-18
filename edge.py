@@ -27,7 +27,7 @@ from config import (
     EDGE_PRE_GAME_EXIT_MIN, EDGE_STALE_HOURS,
     MIN_MARKET_LIQUIDITY, MIN_DAILY_VOLUME,
     POLY_STALE_QUOTE_SEC, POLY_STALE_PENALTY,
-    MAX_TOTAL_EXPOSURE_PCT, MAX_OPEN_POSITIONS,
+    MAX_TOTAL_EXPOSURE_PCT, MAX_OPEN_POSITIONS, STARTING_BANKROLL,
 )
 from harvest import _market_is_stale
 
@@ -118,7 +118,7 @@ async def scan_edge(
                 p.cost for p in positions.positions.values()
                 if p.status in ("open", "filled")
             )
-            exposure_pct = open_cost / max(positions.starting_bankroll, 1)
+            exposure_pct = open_cost / max(STARTING_BANKROLL, 1)
             if exposure_pct >= MAX_TOTAL_EXPOSURE_PCT:
                 logger.debug(
                     f"EDGE: skipping — exposure {exposure_pct:.0%} >= cap {MAX_TOTAL_EXPOSURE_PCT:.0%}"
