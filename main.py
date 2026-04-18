@@ -383,8 +383,9 @@ async def bot_loop(clob, positions, bot_state, sports_ws: SportsWS, market_ws: M
                     if paused or not circuit_ok:
                         _log_event(bot_state, "Paused", engine="edge", level="warning")
                     else:
-                        signals, all_edges = await scan_edge(clob, positions, all_odds, lineup_watcher=lineup_watcher)
+                        signals, all_edges, edge_diag = await scan_edge(clob, positions, all_odds, lineup_watcher=lineup_watcher)
                         bot_state["edges_found"] = all_edges
+                        bot_state["edge_scan_diag"] = edge_diag
                         if signals:
                             _log_event(
                                 bot_state,

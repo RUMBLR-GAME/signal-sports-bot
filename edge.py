@@ -94,17 +94,36 @@ async def scan_edge(
     all_edges: List[dict] = []
 
     if not all_odds:
-        return signals, all_edges
+        return signals, all_edges, {"sports_with_odds": 0, "total_odds": 0}
+
+    # Diagnostic counters for dashboard
+    diag = {
+        "sports_with_odds": 0,
+        "total_odds": len(all_odds),
+        "skipped_no_polymarket_events": 0,
+        "skipped_exposure_cap": 0,
+        "skipped_position_cap": 0,
+        "skipped_duplicate_game": 0,
+        "skipped_wrong_time_window": 0,
+        "skipped_no_market_match": 0,
+        "skipped_low_liquidity": 0,
+        "skipped_duplicate_condition": 0,
+        "skipped_same_game_position": 0,
+        "sides_evaluated": 0,
+        "signals_generated": 0,
+    }
 
     # Group by sport. Prefer sharpest / non-duplicate provider per game.
     by_sport: dict = {}
     for o in all_odds:
         by_sport.setdefault(o.sport, []).append(o)
+    diag["sports_with_odds"] = len(by_sport)
 
     for sport, odds_list in by_sport.items():
         # Fetch Polymarket events for this sport (once)
         events = await clob.fetch_polymarket_events(sport)
         if not events:
+            diag["skipped_no_polymarket_events"] += len(odds_list)
             continue
 
         # Dedupe by game — pick sharpest provider available
@@ -114,8 +133,6 @@ async def scan_edge(
 
         for odds in odds_list:
             # Portfolio-wide caps: don't add new positions when we're at exposure limit.
-            # IMPORTANT: include signals generated earlier in THIS scan as projected exposure,
-            # else a single scan can deploy 100% of capital in one burst.
             open_cost = sum(
                 p.cost for p in positions.positions.values()
                 if p.status in ("open", "filled")
@@ -123,35 +140,41 @@ async def scan_edge(
             projected_cost = open_cost + sum(s.bet_size for s in signals)
             exposure_pct = projected_cost / max(STARTING_BANKROLL, 1)
             if exposure_pct >= MAX_TOTAL_EXPOSURE_PCT:
+                diag["skipped_exposure_cap"] += 1
                 logger.debug(
                     f"EDGE: skipping — projected exposure {exposure_pct:.0%} >= cap {MAX_TOTAL_EXPOSURE_PCT:.0%}"
                 )
-                return signals, all_edges
+                diag["_final_last"] = "exposure_cap_hit"
+                return signals, all_edges, diag
             total_positions = len(positions.positions) + len(signals)
             if total_positions >= MAX_OPEN_POSITIONS:
-                logger.debug(
-                    f"EDGE: skipping — projected {total_positions} >= cap {MAX_OPEN_POSITIONS}"
-                )
-                return signals, all_edges
+                diag["skipped_position_cap"] += 1
+                diag["_final_last"] = "position_cap_hit"
+                return signals, all_edges, diag
 
             key = (odds.home_team.lower(), odds.away_team.lower(), odds.commence_time[:10])
             if key in seen:
+                diag["skipped_duplicate_game"] += 1
                 continue
             seen.add(key)
 
             hours = _hours_until(odds.commence_time)
             if hours is None or hours < EDGE_MIN_HOURS_BEFORE or hours > EDGE_MAX_HOURS_BEFORE:
+                diag["skipped_wrong_time_window"] += 1
                 continue
 
             # Find Polymarket market
             parsed = None
+            low_liq = False
             for ev in events:
                 p = parse_market_tokens(ev)
                 if not p:
                     continue
                 if p.get("liquidity", 0) < MIN_MARKET_LIQUIDITY:
+                    low_liq = True
                     continue
                 if p.get("volume", 0) < MIN_DAILY_VOLUME:
+                    low_liq = True
                     continue
                 hi, ai = match_game_to_market(
                     odds.home_team, odds.home_abbrev,
@@ -166,17 +189,23 @@ async def scan_edge(
                 break
 
             if not parsed:
+                if low_liq:
+                    diag["skipped_low_liquidity"] += 1
+                else:
+                    diag["skipped_no_market_match"] += 1
                 continue
             # Check all condition_ids for this event (soccer has multiple —
             # home-win, away-win, draw are separate markets, must not trade both).
             cids_to_check = parsed.get("_condition_ids") or [parsed["condition_id"]]
             if any(positions.has_position_for(c) for c in cids_to_check):
+                diag["skipped_duplicate_condition"] += 1
                 continue
             # Belt-and-braces: also reject if we already have an edge position
             # on either team (same game = one bet maximum).
             if positions.has_position_for_game(
                 odds.home_team, odds.away_team, engine="edge"
             ):
+                diag["skipped_same_game_position"] += 1
                 continue
 
             hi = parsed["_home_idx"]
@@ -289,9 +318,11 @@ async def scan_edge(
                 f"edge={raw_edge:.3f}{' (stale→'+format(eff_edge,'.3f')+')' if stale else ''} "
                 f"[{odds.provider}] ${size:.2f} | T-{hours:.1f}h"
             )
+            diag["signals_generated"] += 1
 
     all_edges.sort(key=lambda e: e["edge"], reverse=True)
-    return signals, all_edges[:300]
+    diag["sides_evaluated"] = len(all_edges)
+    return signals, all_edges[:300], diag
 
 
 async def check_edge_exits(clob: ClobInterface, positions: PositionManager):
