@@ -265,6 +265,7 @@ async def scan_edge(
             size, sz_reason = compute_bet_size(
                 "edge", poly_price, true_prob, equity, positions,
                 sport=sport, edge=eff_edge, game_start_ts=start_ts,
+                pending_signals=signals,
             )
             if size <= 0:
                 continue

@@ -197,11 +197,12 @@ async def scan_harvest(
             # Penalize the edge, not the raw confidence
             effective_conf = price + (game.confidence - price) * POLY_STALE_PENALTY
 
-        # Size it
+        # Size it — pass in signals queued this scan to prevent cap race
         equity = positions.equity
         size, sz_reason = compute_bet_size(
             "harvest", price, effective_conf, equity, positions,
             sport=game.sport,
+            pending_signals=signals,
         )
         if size <= 0:
             entry.update(status="skip", reason=f"sizing: {sz_reason}")

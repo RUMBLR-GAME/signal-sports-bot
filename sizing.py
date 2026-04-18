@@ -51,10 +51,16 @@ def compute_bet_size(
     sport: str = "",
     edge: float = 0.0,
     game_start_ts: Optional[float] = None,
+    pending_signals: Optional[list] = None,  # signals queued in THIS scan, not yet opened
 ) -> Tuple[float, str]:
     """
     Returns (dollar_size, reason). Size=0 means skip.
     Reason string is human-readable and logged for diagnostics.
+
+    pending_signals: list of objects with .bet_size, .sport, .engine attributes
+    that have been queued in the current scan but not yet opened as positions.
+    Used to prevent scan-race where multiple signals each pass the cap check
+    individually but collectively blow through it.
     """
     if equity <= 0:
         return 0.0, "equity<=0"
@@ -87,27 +93,33 @@ def compute_bet_size(
 
     raw_size = frac * equity
 
-    # Total exposure cap — FIXED to use current equity
+    # Helper to account for pending signals
+    pending = pending_signals or []
+    pending_total = sum(getattr(s, 'bet_size', 0) for s in pending)
+    pending_by_sport = sum(getattr(s, 'bet_size', 0) for s in pending if getattr(s, 'sport', '') == sport)
+    pending_by_engine = sum(getattr(s, 'bet_size', 0) for s in pending if getattr(s, 'engine', '') == engine)
+
+    # Total exposure cap — include pending signals to prevent scan-race
     max_total = equity * MAX_TOTAL_EXPOSURE
-    total_open = positions.open_cost
+    total_open = positions.open_cost + pending_total
     total_room = max_total - total_open
     if total_room <= 0:
-        return 0.0, f"total exposure cap (${total_open:.0f}/${max_total:.0f})"
+        return 0.0, f"total cap (${total_open:.0f}/${max_total:.0f})"
     size = min(raw_size, total_room)
 
     # Engine-specific cap
     if engine == "edge":
         edge_cap = equity * MAX_EDGE_EXPOSURE
-        edge_open = positions.deployed_by_engine("edge")
+        edge_open = positions.deployed_by_engine("edge") + pending_by_engine
         edge_room = edge_cap - edge_open
         if edge_room <= 0:
-            return 0.0, f"edge engine cap (${edge_open:.0f}/${edge_cap:.0f})"
+            return 0.0, f"edge cap (${edge_open:.0f}/${edge_cap:.0f})"
         size = min(size, edge_room)
 
-    # Per-sport cap
+    # Per-sport cap — include pending to prevent same-scan pile-on
     if sport:
         sport_cap = equity * MAX_EXPOSURE_PER_SPORT
-        sport_open = positions.deployed_by_sport(sport)
+        sport_open = positions.deployed_by_sport(sport) + pending_by_sport
         sport_room = sport_cap - sport_open
         if sport_room <= 0:
             return 0.0, f"sport cap {sport} (${sport_open:.0f}/${sport_cap:.0f})"
@@ -126,7 +138,7 @@ def compute_bet_size(
         return 0.0, f"size ${size:.2f} < min ${MIN_TRADE_SIZE}"
 
     reason = (
-        f"kelly={frac/dd_mult/ladder_mult/lion_mult/sport_mult if frac else 0:.3f} "
+        f"kelly={frac/max(dd_mult*ladder_mult*lion_mult*sport_mult,0.0001):.3f} "
         f"sport={sport_mult:.2f} lion={lion_mult:.2f} ladder={ladder_mult:.2f} "
         f"dd={dd_mult:.2f} → ${size:.2f}"
     )

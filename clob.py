@@ -112,6 +112,32 @@ class ClobInterface:
             logger.debug(f"get_price_http {token_id[-8:]} {side}: {e}")
             return None
 
+    async def get_midpoint_http(self, token_id: str) -> Optional[float]:
+        """
+        Pure-HTTP midpoint fetch — works without py_clob_client initialized.
+        Returns midpoint of best bid/ask. Used for dashboard enrichment so
+        both sides of a 2-outcome market show consistent prices.
+        """
+        try:
+            session = await self._get_session()
+            url = f"{CLOB_HOST}/midpoint"
+            params = {"token_id": token_id}
+            async with session.get(url, params=params, timeout=5) as r:
+                if r.status != 200:
+                    return None
+                data = await r.json()
+                mid = data.get("mid")
+                if mid is None:
+                    return None
+                m = float(mid)
+                # Guard against empty-book garbage (0.5 from bid=0, ask=1)
+                if 0.499 < m < 0.501:
+                    return None
+                return m
+        except Exception as e:
+            logger.debug(f"get_midpoint_http {token_id[-8:]}: {e}")
+            return None
+
     async def get_midpoint(self, token_id: str) -> Optional[float]:
         if not self._client:
             return None

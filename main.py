@@ -205,57 +205,46 @@ async def enrich_live_games(clob: ClobInterface, bot_state: dict, market_ws: Mar
             away_tok = parsed["token_ids"][ai]
             tokens_to_subscribe.extend([home_tok, away_tok])
 
-            # Price fetching priority:
-            # 1. WS midpoint (push-based, real-time, free) — IF bid/ask are valid
-            # 2. REST /price (live from CLOB, one HTTP call)
-            # 3. Gamma outcomePrices (STALE — only as labeling fallback, never for trading)
-            home_price = market_ws.midpoint(home_tok)
-            away_price = market_ws.midpoint(away_tok)
-
-            # Reject suspect WS midpoints. When Polymarket's orderbook has no
-            # bids/asks (thin or empty book), `best()` returns (0, 1) → midpoint 0.5.
-            # That's a garbage signal indistinguishable from a genuine 50/50 market.
-            # Reject exactly 0.5 — if real probability is 0.5, REST will return 0.5 too.
-            if home_price is not None and abs(home_price - 0.5) < 0.001:
-                home_price = None
-            if away_price is not None and abs(away_price - 0.5) < 0.001:
-                away_price = None
-
+            # Price fetching: both sides MUST come from the same source
+            # so the pair is consistent (sums ≤1 with spread). Otherwise
+            # mixing WS-midpoint with REST-ask produces nonsense like 85¢+2¢=87¢.
+            home_price = None
+            away_price = None
             debug_tag = f"{g.get('away_team','?')[:10]}@{g.get('home_team','?')[:10]}"
-            logger.info(f"enrich {debug_tag}: WS home={home_price} away={away_price}")
 
-            # If WS has no data yet (not subscribed long enough, or thin book),
-            # fetch live from CLOB REST. Critical for live games where Gamma is stale.
-            # Use HTTP-only method (works in paper mode without py_clob_client auth).
-            if home_price is None:
-                try:
-                    home_price = await clob.get_price_http(home_tok, "BUY")
-                    logger.info(f"enrich {debug_tag}: HTTP home={home_price}")
-                except Exception as e:
-                    logger.warning(f"live price fetch home {debug_tag}: {e}")
-                    home_price = None
-            if away_price is None:
-                try:
-                    away_price = await clob.get_price_http(away_tok, "BUY")
-                    logger.info(f"enrich {debug_tag}: HTTP away={away_price}")
-                except Exception as e:
-                    logger.warning(f"live price fetch away {debug_tag}: {e}")
-                    away_price = None
+            # Strategy 1: both from WS midpoint (preferred — real-time, consistent)
+            h_mid = market_ws.midpoint(home_tok)
+            a_mid = market_ws.midpoint(away_tok)
+            # Reject suspect WS midpoints (empty orderbook returns 0.5)
+            h_valid = h_mid is not None and not (0.499 < h_mid < 0.501)
+            a_valid = a_mid is not None and not (0.499 < a_mid < 0.501)
+            if h_valid and a_valid:
+                home_price = h_mid
+                away_price = a_mid
+                logger.debug(f"enrich {debug_tag}: WS mid home={h_mid:.3f} away={a_mid:.3f}")
 
-            # Last-resort fallback: parsed Gamma price. Mark as stale in state.
-            # This lets the dashboard show SOMETHING but bot logic treats 0.5 as untrustworthy.
+            # Strategy 2: both from REST midpoint endpoint
+            if home_price is None or away_price is None:
+                try:
+                    h_rest = await clob.get_midpoint_http(home_tok)
+                    a_rest = await clob.get_midpoint_http(away_tok)
+                    if h_rest is not None and a_rest is not None:
+                        home_price = h_rest
+                        away_price = a_rest
+                        logger.debug(f"enrich {debug_tag}: REST mid home={h_rest:.3f} away={a_rest:.3f}")
+                except Exception as e:
+                    logger.debug(f"enrich REST mid err {debug_tag}: {e}")
+
+            # Strategy 3: fall back to Gamma outcomePrices (stale but consistent pair)
             price_is_stale = False
-            if home_price is None:
+            if home_price is None or away_price is None:
                 try:
                     home_price = float(parsed["prices"][hi])
-                    price_is_stale = True
-                except Exception:
-                    home_price = None
-            if away_price is None:
-                try:
                     away_price = float(parsed["prices"][ai])
                     price_is_stale = True
+                    logger.debug(f"enrich {debug_tag}: Gamma stale home={home_price:.3f} away={away_price:.3f}")
                 except Exception:
+                    home_price = None
                     away_price = None
 
             if home_price is not None:

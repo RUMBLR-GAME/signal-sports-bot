@@ -65,9 +65,9 @@ MAX_UNFILLED_AGE = _int("MAX_UNFILLED_AGE", 90)
 # ─── EXPOSURE CAPS (THE COMPOUNDING FIX) ─────────────────────────────────────
 # v17 bug: capped at 60% of STARTING_BANKROLL forever → couldn't compound.
 # v18: percentages of CURRENT equity. Now actually compounds.
-MAX_TOTAL_EXPOSURE = _flt("MAX_TOTAL_EXPOSURE", 0.60)       # 60% of equity
+MAX_TOTAL_EXPOSURE = _flt("MAX_TOTAL_EXPOSURE", 0.80)       # 80% of equity (matched with MAX_TOTAL_EXPOSURE_PCT)
 MAX_EDGE_EXPOSURE = _flt("MAX_EDGE_EXPOSURE", 0.40)         # 40% in Edge engine
-MAX_EXPOSURE_PER_SPORT = _flt("MAX_EXPOSURE_PER_SPORT", 0.25)   # 25% per sport
+MAX_EXPOSURE_PER_SPORT = _flt("MAX_EXPOSURE_PER_SPORT", 0.40)   # 40% per sport
 MAX_EXPOSURE_PER_WINDOW = _flt("MAX_EXPOSURE_PER_WINDOW", 0.35) # 35% in any 4h window
 CORRELATION_WINDOW_HOURS = _flt("CORRELATION_WINDOW_HOURS", 4.0)
 
@@ -78,7 +78,7 @@ MIN_DAILY_VOLUME = _flt("MIN_DAILY_VOLUME", 5000)
 # ─── KELLY ───────────────────────────────────────────────────────────────────
 KELLY_FRACTION = _flt("KELLY_FRACTION", 0.25)
 MAX_POSITION_PCT = _flt("MAX_POSITION_PCT", 0.10)
-MIN_TRADE_SIZE = _flt("MIN_TRADE_SIZE", 5)
+MIN_TRADE_SIZE = _flt("MIN_TRADE_SIZE", 2)
 
 # ─── DRAWDOWN GOVERNOR ───────────────────────────────────────────────────────
 # Auto-halves Kelly when equity drops this far below peak. Protects compounding.
