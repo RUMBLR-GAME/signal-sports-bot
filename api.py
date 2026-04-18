@@ -166,6 +166,7 @@ def create_api(positions: PositionManager, bot_state: dict, clob: ClobInterface 
                     "edges_found": bot_state.get("edges_found", []),
                     "edge_scan_diag": bot_state.get("edge_scan_diag", {}),
                     "odds_source_counts": bot_state.get("odds_source_counts", {}),
+                    "oddsapi_league_diag": bot_state.get("oddsapi_league_diag", {}),
                     "blowout_log": bot_state.get("blowout_log", []),
                     "sports_with_odds": bot_state.get("sports_with_odds", []),
                     "poly_diag": bot_state.get("poly_diag", {}),

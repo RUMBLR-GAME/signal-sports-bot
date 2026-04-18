@@ -248,6 +248,15 @@ def _normalize_event(event: dict, sport_key: str, preferred_books: List[str]) ->
 
 
 # ─── League fetch with caching ─────────────────────────────────────────────
+# Per-league diagnostic state (exposed to dashboard)
+_LEAGUE_DIAG: dict = {}
+
+
+def get_league_diag() -> dict:
+    """Returns snapshot of per-league fetch results for dashboard."""
+    return dict(_LEAGUE_DIAG)
+
+
 async def _fetch_league_cached(
     session: aiohttp.ClientSession,
     sport_key: str,
@@ -259,13 +268,28 @@ async def _fetch_league_cached(
     cached = _ODDS_CACHE.get(sport_key)
     if cached and (now - cached[0]) < CACHE_TTL_SEC:
         logger.info(f"odds_api[{sport_key}]: cache hit, {len(cached[1])} odds")
+        _LEAGUE_DIAG[sport_key] = {
+            "cache_hit": True, "events_raw": 0, "events_upcoming": 0,
+            "odds_fetched": 0, "final": len(cached[1]), "error": "",
+            "slug": league_slug,
+        }
         return cached[1]
+
+    diag = {
+        "cache_hit": False, "events_raw": 0, "events_upcoming": 0,
+        "odds_fetched": 0, "normalized": 0, "final": 0,
+        "rejections": {}, "error": "",
+        "slug": league_slug,
+    }
 
     # Use first bookmaker for the event filter (the /events endpoint takes 1 bookmaker)
     primary_book = bookmakers[0] if bookmakers else "Bet365"
     events = await _fetch_events_for_league(session, league_slug, primary_book)
+    diag["events_raw"] = len(events)
     logger.info(f"odds_api[{sport_key}]: /events returned {len(events)} raw events (slug={league_slug})")
     if not events:
+        diag["error"] = "no_events_from_api"
+        _LEAGUE_DIAG[sport_key] = diag
         if cached:
             return cached[1]
         _ODDS_CACHE[sport_key] = (now, [])
@@ -284,30 +308,32 @@ async def _fetch_league_cached(
                 upcoming.append(ev)
         except Exception as ex:
             logger.debug(f"odds_api[{sport_key}]: date parse err: {ex}")
+    diag["events_upcoming"] = len(upcoming)
     logger.info(f"odds_api[{sport_key}]: {len(upcoming)} events within 48h window")
     if not upcoming:
+        diag["error"] = "no_events_in_48h_window"
+        _LEAGUE_DIAG[sport_key] = diag
         _ODDS_CACHE[sport_key] = (now, [])
         return []
 
     # Fetch odds in batches of 10 (1 request per 10 events)
     all_game_odds: List[GameOdds] = []
+    total_rejections = {"no_home_away": 0, "no_bookmakers": 0, "no_matching_book": 0, "no_ml": 0, "bad_probs": 0}
+    total_odds_batch = 0
     for i in range(0, len(upcoming), 10):
         chunk = upcoming[i : i + 10]
         event_ids = [e.get("id") for e in chunk if e.get("id") is not None]
         odds_batch = await _fetch_odds_batch(session, event_ids, bookmakers)
+        total_odds_batch += len(odds_batch)
         logger.info(f"odds_api[{sport_key}]: /odds/multi for {len(event_ids)} IDs returned {len(odds_batch)} events with odds")
-        normalized_count = 0
-        rejected_reasons = {"no_home_away": 0, "no_bookmakers": 0, "no_matching_book": 0, "no_ml": 0, "bad_probs": 0}
         for ev in odds_batch:
-            # Manual replication of _normalize_event's rejection path for debug
             if not (ev.get("home") and ev.get("away")):
-                rejected_reasons["no_home_away"] += 1
+                total_rejections["no_home_away"] += 1
                 continue
             bms = ev.get("bookmakers") or {}
             if not bms:
-                rejected_reasons["no_bookmakers"] += 1
+                total_rejections["no_bookmakers"] += 1
                 continue
-            # Case-insensitive match
             book_keys_lower = {k.lower(): k for k in bms.keys()}
             found_book = None
             for book_pref in bookmakers:
@@ -315,21 +341,28 @@ async def _fetch_league_cached(
                     found_book = book_keys_lower[book_pref.lower()]
                     break
             if not found_book:
-                rejected_reasons["no_matching_book"] += 1
+                total_rejections["no_matching_book"] += 1
                 logger.info(f"  event {ev.get('id')}: bookmakers present = {list(bms.keys())} (wanted {bookmakers})")
                 continue
             ml = _extract_ml_odds(bms[found_book])
             if not ml:
-                rejected_reasons["no_ml"] += 1
+                total_rejections["no_ml"] += 1
                 continue
-            # Let _normalize_event do the actual work
             go = _normalize_event(ev, sport_key, bookmakers)
             if go:
                 all_game_odds.append(go)
-                normalized_count += 1
             else:
-                rejected_reasons["bad_probs"] += 1
-        logger.info(f"odds_api[{sport_key}]: normalized {normalized_count}/{len(odds_batch)} — rejections: {rejected_reasons}")
+                total_rejections["bad_probs"] += 1
+
+    diag["odds_fetched"] = total_odds_batch
+    diag["normalized"] = len(all_game_odds)
+    diag["final"] = len(all_game_odds)
+    diag["rejections"] = total_rejections
+    if not all_game_odds and total_odds_batch > 0:
+        diag["error"] = "all_events_rejected"
+    elif not all_game_odds:
+        diag["error"] = "odds_multi_returned_empty"
+    _LEAGUE_DIAG[sport_key] = diag
 
     if all_game_odds:
         _ODDS_CACHE[sport_key] = (now, all_game_odds)

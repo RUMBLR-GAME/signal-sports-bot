@@ -386,6 +386,7 @@ async def bot_loop(clob, positions, bot_state, sports_ws: SportsWS, market_ws: M
                         "espn_sports": sorted({o.sport for o in espn_odds}),
                         "oddsapi_sports": sorted({o.sport for o in oa_odds}),
                     }
+                    bot_state["oddsapi_league_diag"] = odds_api.get_league_diag()
 
                     if paused or not circuit_ok:
                         _log_event(bot_state, "Paused", engine="edge", level="warning")
