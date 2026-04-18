@@ -258,6 +258,19 @@ async def scan_edge(
 
             # Log ALL edges for diagnostics
             for se in side_edges:
+                # Tag each side with its eventual disposition
+                if se["eff_edge"] < EDGE_MIN_EDGE:
+                    status = "SKIP_LOW_EDGE"
+                    reason = f"edge {se['eff_edge']:.3f} < min {EDGE_MIN_EDGE:.2f}"
+                elif se["poly_price"] < EDGE_MIN_PRICE:
+                    status = "SKIP_PRICE_LOW"
+                    reason = f"price {se['poly_price']:.3f} < min {EDGE_MIN_PRICE:.2f}"
+                elif se["poly_price"] > EDGE_MAX_PRICE:
+                    status = "SKIP_PRICE_HIGH"
+                    reason = f"price {se['poly_price']:.3f} > max {EDGE_MAX_PRICE:.2f}"
+                else:
+                    status = "CANDIDATE"   # passed filters; may still lose to other side
+                    reason = ""
                 all_edges.append({
                     "team": se["team"], "sport": sport,
                     "poly": se["poly_price"], "true": se["true_prob"],
@@ -269,6 +282,8 @@ async def scan_edge(
                     "lineup_detail": (lineup_sig or {}).get("detail", "") if se["lineup_adj"] else "",
                     "commence_time": odds.commence_time,
                     "liquidity": parsed.get("liquidity", 0),
+                    "status": status,
+                    "reason": reason,
                 })
 
             # Pick only the side with LARGEST effective edge
@@ -277,6 +292,15 @@ async def scan_edge(
             if not tradable:
                 continue
             best = max(tradable, key=lambda x: x["eff_edge"])
+
+            # Mark the non-best side as SKIP_NOT_BEST if both passed
+            for e in all_edges:
+                if (e.get("team") in (s["team"] for s in side_edges)
+                    and e.get("status") == "CANDIDATE"
+                    and e.get("team") != best["team"]
+                    and e.get("commence_time") == odds.commence_time):
+                    e["status"] = "SKIP_NOT_BEST_SIDE"
+                    e["reason"] = f"other side has higher edge ({best['eff_edge']:.3f})"
 
             # Size it
             team = best["team"]
@@ -297,7 +321,22 @@ async def scan_edge(
                 pending_signals=signals,
             )
             if size <= 0:
+                # Update the matching finding with SKIP_SIZE
+                for e in all_edges:
+                    if (e.get("team") == best["team"]
+                        and e.get("commence_time") == odds.commence_time
+                        and e.get("status") == "CANDIDATE"):
+                        e["status"] = "SKIP_SIZE"
+                        e["reason"] = sz_reason
                 continue
+
+            # Mark best side as TRADED
+            for e in all_edges:
+                if (e.get("team") == best["team"]
+                    and e.get("commence_time") == odds.commence_time
+                    and e.get("status") == "CANDIDATE"):
+                    e["status"] = "TRADED"
+                    e["reason"] = f"bet ${size:.2f}"
 
             signals.append(EdgeSignal(
                 sport=sport, espn_id=odds.espn_id,

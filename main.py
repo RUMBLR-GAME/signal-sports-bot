@@ -55,6 +55,17 @@ def _log_event(bot_state, msg, level="info", engine=""):
         bot_state["scan_log"] = bot_state["scan_log"][-SCAN_LOG_MAX:]
 
 
+SCAN_HISTORY_MAX = 500  # keep last ~16 hours of scan records
+
+
+def _record_scan(bot_state, entry: dict):
+    """Append a scan record (edge or harvest) and cap history length."""
+    hist = bot_state.setdefault("scan_history", [])
+    hist.append(entry)
+    if len(hist) > SCAN_HISTORY_MAX:
+        del hist[:len(hist) - SCAN_HISTORY_MAX]
+
+
 # ─── Signal execution ──────────────────────────────────────────────────
 async def execute_signal(signal, clob: ClobInterface, positions: PositionManager):
     price = getattr(signal, "clob_price", 0)
@@ -332,6 +343,9 @@ async def bot_loop(clob, positions, bot_state, sports_ws: SportsWS, market_ws: M
                 scans += 1
                 bot_state["scan_count"] = scans
                 bot_state["last_harvest_scan"] = now
+                scan_start = time.time()
+                h_signals_count = 0
+                h_findings = []
                 try:
                     blowouts, live, _ = await _get_espn_data()
                     bot_state["live_games"] = live
@@ -347,6 +361,8 @@ async def bot_loop(clob, positions, bot_state, sports_ws: SportsWS, market_ws: M
                     else:
                         signals, diag = await scan_harvest(clob, positions, blowouts)
                         bot_state["blowout_log"] = diag
+                        h_findings = diag  # each diag entry has team/lead/confidence/price/status/reason
+                        h_signals_count = len(signals)
                         for s in signals:
                             await execute_signal(s, clob, positions)
                             _log_event(
@@ -366,11 +382,27 @@ async def bot_loop(clob, positions, bot_state, sports_ws: SportsWS, market_ws: M
                 except Exception as e:
                     logger.error(f"harvest: {e}", exc_info=True)
                     _log_event(bot_state, f"harvest err: {e}", level="error", engine="harvest")
+                # Record scan in history
+                _record_scan(bot_state, {
+                    "id": scans,
+                    "engine": "harvest",
+                    "ts": scan_start,
+                    "duration_ms": int((time.time() - scan_start) * 1000),
+                    "live_games": len(bot_state.get("live_games", [])),
+                    "blowouts_found": len([b for b in h_findings if b.get("status") == "signal"]),
+                    "total_findings": len(h_findings),
+                    "signals": h_signals_count,
+                    "findings": h_findings[:100],   # cap per scan
+                })
 
             # EDGE scan (every 2 min)
             if EDGE_ENABLED and now - last["edge_scan"] >= EDGE_SCAN_INTERVAL:
                 last["edge_scan"] = now
                 bot_state["last_edge_scan"] = now
+                scan_start = time.time()
+                e_findings = []
+                e_signals = 0
+                e_odds_src = {}
                 try:
                     # Reuse cached ESPN data
                     _, _, espn_odds = await _get_espn_data()
@@ -379,13 +411,14 @@ async def bot_loop(clob, positions, bot_state, sports_ws: SportsWS, market_ws: M
 
                     sports_with = sorted({o.sport for o in all_odds})
                     bot_state["sports_with_odds"] = sports_with
-                    bot_state["odds_source_counts"] = {
+                    e_odds_src = {
                         "espn_odds": len(espn_odds),
                         "oddsapi_odds": len(oa_odds),
                         "total": len(all_odds),
                         "espn_sports": sorted({o.sport for o in espn_odds}),
                         "oddsapi_sports": sorted({o.sport for o in oa_odds}),
                     }
+                    bot_state["odds_source_counts"] = e_odds_src
                     bot_state["oddsapi_league_diag"] = odds_api.get_league_diag()
 
                     if paused or not circuit_ok:
@@ -394,6 +427,8 @@ async def bot_loop(clob, positions, bot_state, sports_ws: SportsWS, market_ws: M
                         signals, all_edges, edge_diag = await scan_edge(clob, positions, all_odds, lineup_watcher=lineup_watcher)
                         bot_state["edges_found"] = all_edges
                         bot_state["edge_scan_diag"] = edge_diag
+                        e_findings = all_edges
+                        e_signals = len(signals)
                         if signals:
                             _log_event(
                                 bot_state,
@@ -415,6 +450,17 @@ async def bot_loop(clob, positions, bot_state, sports_ws: SportsWS, market_ws: M
                             )
                 except Exception as e:
                     logger.error(f"edge: {e}", exc_info=True)
+                # Record edge scan
+                _record_scan(bot_state, {
+                    "id": scans,
+                    "engine": "edge",
+                    "ts": scan_start,
+                    "duration_ms": int((time.time() - scan_start) * 1000),
+                    "odds_sources": e_odds_src,
+                    "total_findings": len(e_findings),
+                    "signals": e_signals,
+                    "findings": e_findings[:100],   # cap per scan
+                })
 
             # EDGE exit (every 30s)
             if EDGE_ENABLED and now - last["edge_exit"] >= EDGE_EXIT_INTERVAL:
@@ -488,6 +534,7 @@ async def main():
         "started_at": time.time(),
         "scan_count": 0,
         "scan_log": [],
+        "scan_history": [],
         "live_games": [],
         "edges_found": [],
         "blowout_log": [],

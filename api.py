@@ -167,6 +167,17 @@ def create_api(positions: PositionManager, bot_state: dict, clob: ClobInterface 
                     "edge_scan_diag": bot_state.get("edge_scan_diag", {}),
                     "odds_source_counts": bot_state.get("odds_source_counts", {}),
                     "oddsapi_league_diag": bot_state.get("oddsapi_league_diag", {}),
+                    "scan_history_summary": [
+                        {
+                            "id": s.get("id"),
+                            "engine": s.get("engine"),
+                            "ts": s.get("ts"),
+                            "duration_ms": s.get("duration_ms"),
+                            "total_findings": s.get("total_findings", 0),
+                            "signals": s.get("signals", 0),
+                        }
+                        for s in bot_state.get("scan_history", [])[-50:]
+                    ],
                     "blowout_log": bot_state.get("blowout_log", []),
                     "sports_with_odds": bot_state.get("sports_with_odds", []),
                     "poly_diag": bot_state.get("poly_diag", {}),
@@ -271,9 +282,31 @@ def create_api(positions: PositionManager, bot_state: dict, clob: ClobInterface 
             "trades": closed,
         }, headers=_cors_headers(req))
 
-    for path in ["/api/state", "/health", "/api/pause", "/api/resume", "/api/reset", "/api/close-all"]:
+    async def scans(req):
+        """GET /api/scans?limit=100&engine=edge — full scan history with findings.
+        Query params:
+          limit: max entries to return (default 100, cap 500)
+          engine: filter by 'edge' or 'harvest'
+        """
+        try:
+            limit = min(500, int(req.query.get("limit", 100)))
+        except ValueError:
+            limit = 100
+        eng = req.query.get("engine", "").lower()
+        history = bot_state.get("scan_history", [])
+        if eng in ("edge", "harvest"):
+            history = [s for s in history if s.get("engine") == eng]
+        # Return newest first, up to limit
+        history = list(reversed(history))[:limit]
+        return web.json_response({
+            "scans": history,
+            "total_retained": len(bot_state.get("scan_history", [])),
+        }, headers=_cors_headers(req))
+
+    for path in ["/api/state", "/health", "/api/pause", "/api/resume", "/api/reset", "/api/close-all", "/api/scans"]:
         app.router.add_route("OPTIONS", path, options)
     app.router.add_route("GET", "/api/state", state)
+    app.router.add_route("GET", "/api/scans", scans)
     app.router.add_route("GET", "/health", health)
     app.router.add_route("GET", "/", health)
     app.router.add_route("POST", "/api/pause", pause)
