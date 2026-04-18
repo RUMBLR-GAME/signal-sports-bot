@@ -99,7 +99,7 @@ HARVEST_MIN_EDGE = _flt("HARVEST_MIN_EDGE", 0.01)
 
 # Portfolio-wide caps: prevent the bot from deploying 100% of capital at once
 # and leaving nothing in reserve for better edges that appear later.
-MAX_TOTAL_EXPOSURE_PCT = _flt("MAX_TOTAL_EXPOSURE_PCT", 0.6)  # max 60% of bankroll in open positions
+MAX_TOTAL_EXPOSURE_PCT = _flt("MAX_TOTAL_EXPOSURE_PCT", 0.8)  # max 80% of bankroll in open positions (edge capped at 40% separately)
 MAX_OPEN_POSITIONS = int(_flt("MAX_OPEN_POSITIONS", 8))  # diversification cap
 # Partial exit: sell 50% when price reaches this level. Recycles capital.
 HARVEST_PARTIAL_EXIT_PRICE = _flt("HARVEST_PARTIAL_EXIT_PRICE", 0.985)
