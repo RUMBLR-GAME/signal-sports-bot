@@ -77,7 +77,7 @@ MIN_DAILY_VOLUME = _flt("MIN_DAILY_VOLUME", 5000)
 
 # ─── KELLY ───────────────────────────────────────────────────────────────────
 KELLY_FRACTION = _flt("KELLY_FRACTION", 0.25)
-MAX_POSITION_PCT = _flt("MAX_POSITION_PCT", 0.10)
+MAX_POSITION_PCT = _flt("MAX_POSITION_PCT", 0.15)
 MIN_TRADE_SIZE = _flt("MIN_TRADE_SIZE", 2)
 
 # ─── DRAWDOWN GOVERNOR ───────────────────────────────────────────────────────
