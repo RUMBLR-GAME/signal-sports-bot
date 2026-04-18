@@ -67,6 +67,7 @@ def create_api(positions: PositionManager, bot_state: dict, clob: ClobInterface 
                     "true_prob": p.true_prob, "edge": p.edge_at_entry,
                     "status": p.status,
                     "opened_at": p.opened_at,
+                    "last_mark_at": p.last_mark_at,
                     "game_start_time": p.game_start_time,
                     "partial_exits": p.partial_exits,
                     "score_line": p.score_line,
