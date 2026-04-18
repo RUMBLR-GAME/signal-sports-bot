@@ -191,6 +191,15 @@ async def enrich_live_games(clob: ClobInterface, bot_state: dict, market_ws: Mar
         sport = g.get("sport")
         if not sport:
             continue
+        # Clear stale enrichment before re-matching. If parser now rejects
+        # a market we previously matched (e.g. after a derivative-title fix),
+        # we don't want to keep showing the old bad data.
+        g.pop("market", None)
+        g.pop("condition_id", None)
+        g.pop("home_poly", None)
+        g.pop("away_poly", None)
+        g.pop("home_token_id", None)
+        g.pop("away_token_id", None)
         events = await get_poly(sport)
         for ev in events:
             parsed = parse_market_tokens(ev)
