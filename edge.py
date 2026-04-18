@@ -298,9 +298,22 @@ async def check_edge_exits(clob: ClobInterface, positions: PositionManager):
     """
     Priority: pre-game exit > take-profit > stop-loss > stale.
     Updates position mark-to-market prices along the way.
+
+    In paper mode (no authenticated CLOB client), clob.get_price returns None.
+    We fall back to the HTTP midpoint endpoint so exits still fire.
     """
     for pos in positions.get_filled_by_engine("edge"):
+        # Try authenticated SELL price first (real fills at bid)
         current = await clob.get_price(pos.token_id, "SELL")
+        # Paper-mode fallback: HTTP midpoint
+        if current is None:
+            current = await clob.get_midpoint_http(pos.token_id)
+        # Gamma fallback (stale but better than nothing)
+        if current is None:
+            try:
+                current = float(pos.current_price or pos.entry_price)
+            except Exception:
+                current = None
         if current is None:
             continue
         positions.mark_current_price(pos.id, current)
@@ -308,7 +321,7 @@ async def check_edge_exits(clob: ClobInterface, positions: PositionManager):
         entry = pos.fill_price or pos.entry_price
         age_hours = (time.time() - pos.opened_at) / 3600.0
 
-        # 1. Pre-game exit
+        # 1. Pre-game exit — LOCK IN THE EDGE before game starts
         mins_to_game = None
         if pos.game_start_time:
             start_ts = _ts_until(pos.game_start_time)

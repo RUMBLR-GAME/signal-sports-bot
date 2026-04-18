@@ -145,7 +145,10 @@ async def check_harvest_partials(clob: ClobInterface, positions: PositionManager
     for pos in positions.get_filled_by_engine("harvest"):
         if pos.partial_exits > 0:
             continue
+        # Try authenticated SELL first, fall back to HTTP midpoint for paper mode
         current = await clob.get_price(pos.token_id, "SELL")
+        if current is None:
+            current = await clob.get_midpoint_http(pos.token_id)
         if current is None:
             continue
         positions.mark_current_price(pos.id, current)
