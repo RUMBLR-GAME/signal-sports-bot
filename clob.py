@@ -262,9 +262,35 @@ class ClobInterface:
             ev for ev in raw
             if not any(w in ev.get("title", "").lower() for w in FUTURES_BLOCK)
         ]
+        # Diagnostic: check what parse_market_tokens returns for each filtered event
+        structures = {"classic": 0, "soccer_3way": 0, "no_parse": 0}
+        sample_parses = []
+        for ev in filtered[:20]:
+            parsed = parse_market_tokens(ev)
+            if parsed is None:
+                structures["no_parse"] += 1
+                if len(sample_parses) < 5:
+                    children = ev.get("markets", [])
+                    child_q = [m.get("question", "")[:30] for m in children[:3]]
+                    sample_parses.append({
+                        "title": ev.get("title", "")[:60],
+                        "status": "NO_PARSE",
+                        "n_children": len(children),
+                        "child_questions": child_q,
+                    })
+            else:
+                structures[parsed.get("_structure", "classic")] += 1
+                if len(sample_parses) < 5:
+                    sample_parses.append({
+                        "title": ev.get("title", "")[:60],
+                        "status": parsed.get("_structure", "?"),
+                        "outcomes": parsed.get("outcomes", [])[:2],
+                    })
         self.poly_diag[sport] = {
             "tag": f"series={series_id}", "raw": len(raw), "filtered": len(filtered),
-            "sample_titles": [ev.get("title", "") for ev in filtered[:5]],
+            "sample_titles": [ev.get("title", "") for ev in filtered[:10]],
+            "structures": structures,
+            "sample_parses": sample_parses,
         }
         self._events_cache[sport] = (now, filtered)
         return filtered
