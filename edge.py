@@ -114,21 +114,25 @@ async def scan_edge(
 
         for odds in odds_list:
             # Portfolio-wide caps: don't add new positions when we're at exposure limit.
+            # IMPORTANT: include signals generated earlier in THIS scan as projected exposure,
+            # else a single scan can deploy 100% of capital in one burst.
             open_cost = sum(
                 p.cost for p in positions.positions.values()
                 if p.status in ("open", "filled")
             )
-            exposure_pct = open_cost / max(STARTING_BANKROLL, 1)
+            projected_cost = open_cost + sum(s.bet_size for s in signals)
+            exposure_pct = projected_cost / max(STARTING_BANKROLL, 1)
             if exposure_pct >= MAX_TOTAL_EXPOSURE_PCT:
                 logger.debug(
-                    f"EDGE: skipping — exposure {exposure_pct:.0%} >= cap {MAX_TOTAL_EXPOSURE_PCT:.0%}"
+                    f"EDGE: skipping — projected exposure {exposure_pct:.0%} >= cap {MAX_TOTAL_EXPOSURE_PCT:.0%}"
                 )
-                return signals, diag
-            if len(positions.positions) >= MAX_OPEN_POSITIONS:
+                return signals, all_edges
+            total_positions = len(positions.positions) + len(signals)
+            if total_positions >= MAX_OPEN_POSITIONS:
                 logger.debug(
-                    f"EDGE: skipping — {len(positions.positions)} open >= cap {MAX_OPEN_POSITIONS}"
+                    f"EDGE: skipping — projected {total_positions} >= cap {MAX_OPEN_POSITIONS}"
                 )
-                return signals, diag
+                return signals, all_edges
 
             key = (odds.home_team.lower(), odds.away_team.lower(), odds.commence_time[:10])
             if key in seen:
@@ -194,13 +198,16 @@ async def scan_edge(
                     lineup_shift_home = h_imp * conf
                     lineup_shift_away = a_imp * conf
 
-            # Evaluate both sides
+            # Evaluate both sides BUT only trade the one with larger edge.
+            # Taking both sides of the same match guarantees a loss on draw
+            # and costs the spread on either result. One bet per game max.
             sides = [
                 (odds.home_team, odds.home_prob + lineup_shift_home, odds.home_ml, hi, lineup_shift_home),
                 (odds.away_team, odds.away_prob + lineup_shift_away, odds.away_ml, ai, lineup_shift_away),
             ]
+            # Fetch prices + compute edges for both first
+            side_edges = []
             for team, true_prob, ml, idx, lineup_adj in sides:
-                # Clamp to valid probability
                 true_prob = max(0.02, min(0.98, true_prob))
                 tid = parsed["token_ids"][idx]
                 poly_price = await clob.get_price(tid, "BUY")
@@ -208,41 +215,62 @@ async def scan_edge(
                     try:
                         poly_price = float(parsed["prices"][idx])
                     except Exception:
-                        continue
-
+                        poly_price = None
+                if poly_price is None:
+                    continue
                 raw_edge = true_prob - poly_price
-                # Stale penalty reduces effective edge
                 eff_edge = raw_edge * POLY_STALE_PENALTY if stale else raw_edge
+                side_edges.append({
+                    "team": team, "true_prob": true_prob, "ml": ml, "idx": idx,
+                    "tid": tid, "poly_price": poly_price,
+                    "raw_edge": raw_edge, "eff_edge": eff_edge,
+                    "lineup_adj": lineup_adj,
+                })
 
+            # Log ALL edges for diagnostics
+            for se in side_edges:
                 all_edges.append({
-                    "team": team, "sport": sport,
-                    "poly": poly_price, "true": true_prob,
-                    "edge": raw_edge, "effective_edge": eff_edge,
-                    "provider": odds.provider, "moneyline": ml,
+                    "team": se["team"], "sport": sport,
+                    "poly": se["poly_price"], "true": se["true_prob"],
+                    "edge": se["raw_edge"], "effective_edge": se["eff_edge"],
+                    "provider": odds.provider, "moneyline": se["ml"],
                     "hours": round(hours, 1),
                     "stale": stale,
-                    "lineup_adj": round(lineup_adj, 4) if lineup_adj else 0,
-                    "lineup_detail": (lineup_sig or {}).get("detail", "") if lineup_adj else "",
+                    "lineup_adj": round(se["lineup_adj"], 4) if se["lineup_adj"] else 0,
+                    "lineup_detail": (lineup_sig or {}).get("detail", "") if se["lineup_adj"] else "",
                     "commence_time": odds.commence_time,
                     "liquidity": parsed.get("liquidity", 0),
                 })
 
-                if eff_edge < EDGE_MIN_EDGE:
-                    continue
-                if poly_price > EDGE_MAX_PRICE or poly_price < EDGE_MIN_PRICE:
-                    continue
+            # Pick only the side with LARGEST effective edge
+            tradable = [se for se in side_edges if se["eff_edge"] >= EDGE_MIN_EDGE
+                        and EDGE_MIN_PRICE <= se["poly_price"] <= EDGE_MAX_PRICE]
+            if not tradable:
+                continue
+            best = max(tradable, key=lambda x: x["eff_edge"])
 
-                start_ts = _ts_until(odds.commence_time)
-                equity = positions.equity
-                size, sz_reason = compute_bet_size(
-                    "edge", poly_price, true_prob, equity, positions,
-                    sport=sport, edge=eff_edge, game_start_ts=start_ts,
-                )
-                if size <= 0:
-                    continue
+            # Size it
+            team = best["team"]
+            true_prob = best["true_prob"]
+            ml = best["ml"]
+            idx = best["idx"]
+            tid = best["tid"]
+            poly_price = best["poly_price"]
+            raw_edge = best["raw_edge"]
+            eff_edge = best["eff_edge"]
+            lineup_adj = best["lineup_adj"]
 
-                signals.append(EdgeSignal(
-                    sport=sport, espn_id=odds.espn_id,
+            start_ts = _ts_until(odds.commence_time)
+            equity = positions.equity
+            size, sz_reason = compute_bet_size(
+                "edge", poly_price, true_prob, equity, positions,
+                sport=sport, edge=eff_edge, game_start_ts=start_ts,
+            )
+            if size <= 0:
+                continue
+
+            signals.append(EdgeSignal(
+                sport=sport, espn_id=odds.espn_id,
                     condition_id=parsed["condition_id"],
                     market_question=parsed["question"],
                     team=team,
@@ -254,12 +282,12 @@ async def scan_edge(
                     bet_size=size, confidence=true_prob,
                     commence_time=odds.commence_time,
                     sizing_reason=sz_reason,
-                ))
-                logger.info(
-                    f"EDGE [{sport}]: {team} @{poly_price:.3f} true={true_prob:.3f} "
-                    f"edge={raw_edge:.3f}{' (stale→'+format(eff_edge,'.3f')+')' if stale else ''} "
-                    f"[{odds.provider}] ${size:.2f} | T-{hours:.1f}h"
-                )
+            ))
+            logger.info(
+                f"EDGE [{sport}]: {team} @{poly_price:.3f} true={true_prob:.3f} "
+                f"edge={raw_edge:.3f}{' (stale→'+format(eff_edge,'.3f')+')' if stale else ''} "
+                f"[{odds.provider}] ${size:.2f} | T-{hours:.1f}h"
+            )
 
     all_edges.sort(key=lambda e: e["edge"], reverse=True)
     return signals, all_edges[:300]
