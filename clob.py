@@ -115,25 +115,41 @@ class ClobInterface:
     async def get_midpoint_http(self, token_id: str) -> Optional[float]:
         """
         Pure-HTTP midpoint fetch — works without py_clob_client initialized.
-        Returns midpoint of best bid/ask. Used for dashboard enrichment so
-        both sides of a 2-outcome market show consistent prices.
+        Uses /book endpoint to get bid+ask and validate the pair is real
+        (rejects empty-book garbage like bid=1/ask=1, bid=0/ask=0,
+        or wide spreads that sum inconsistently across sides).
         """
         try:
             session = await self._get_session()
-            url = f"{CLOB_HOST}/midpoint"
+            url = f"{CLOB_HOST}/book"
             params = {"token_id": token_id}
             async with session.get(url, params=params, timeout=5) as r:
                 if r.status != 200:
                     return None
                 data = await r.json()
-                mid = data.get("mid")
-                if mid is None:
+                bids = data.get("bids", []) or []
+                asks = data.get("asks", []) or []
+                if not bids or not asks:
+                    return None  # one-sided book — can't compute real midpoint
+                try:
+                    best_bid = float(bids[0].get("price", 0))
+                    best_ask = float(asks[0].get("price", 0))
+                except (TypeError, ValueError, IndexError):
                     return None
-                m = float(mid)
-                # Guard against empty-book garbage (0.5 from bid=0, ask=1)
-                if 0.499 < m < 0.501:
+                # Reject nonsense books (flat bid=ask, degenerate ranges)
+                if best_bid <= 0 or best_ask <= 0:
                     return None
-                return m
+                if best_bid >= best_ask:
+                    return None  # crossed or flat book — not real
+                if best_ask - best_bid > 0.25:
+                    return None  # spread too wide (> 25¢) — illiquid, untrustworthy
+                mid = (best_bid + best_ask) / 2.0
+                # Edge-case: midpoints at extremes (<2¢ or >98¢) only valid
+                # if the spread is tight. If spread is >5¢ AND we're near extremes,
+                # the quote is too thin to trust.
+                if (mid < 0.03 or mid > 0.97) and (best_ask - best_bid) > 0.05:
+                    return None
+                return mid
         except Exception as e:
             logger.debug(f"get_midpoint_http {token_id[-8:]}: {e}")
             return None
@@ -420,6 +436,13 @@ def parse_market_tokens(market: dict) -> Optional[dict]:
             "first goal", "correct score", "half-time", "halftime",
             "draw no bet", "double chance", "dnb", "btts",
             "corners", "bookings", "cards", "penalty",
+            "1h moneyline", "2h moneyline",
+            "first half moneyline", "second half moneyline",
+            "1st quarter", "2nd quarter", "3rd quarter", "4th quarter",
+            "1st period", "2nd period", "3rd period",
+            "first 5 innings", "5 innings",
+            "1st inning", "2nd inning",
+            ": 1h ", ": 2h ", ": 1st half", ": 2nd half",
         )
 
         def is_derivative(q: str) -> bool:
@@ -452,14 +475,24 @@ def parse_market_tokens(market: dict) -> Optional[dict]:
         title_lower = event_title.lower()
 
         # REJECT events whose title indicates they ARE derivatives overall.
-        # Polymarket lists "Team A vs. Team B - More Markets" (totals O/U) and
-        # "Team A vs. Team B - Exact Score" (goalscorer markets) as separate
-        # events alongside the real moneyline. We want ONLY the moneyline event.
+        # Polymarket lists many variants alongside the real moneyline:
+        #   "Team A vs. Team B - More Markets" (totals O/U)
+        #   "Team A vs. Team B - Exact Score" (goalscorer markets)
+        #   "Team A vs. Team B: 1H Moneyline" (first-half only)
+        #   "Team A vs. Team B: 1st Quarter Moneyline" (quarter only)
+        # We want ONLY the full-game moneyline event.
         DERIV_TITLE_SUFFIXES = (
             "- more markets", "- exact score", "- goalscorer",
             "- total goals", "- total points", "- spread",
-            "- first half", "- 1st half", "- 2nd half",
-            "- first period", "- first quarter", "- half time",
+            ": 1h", ": 2h", ": 1st half", ": 2nd half",
+            ": 1st quarter", ": 2nd quarter", ": 3rd quarter", ": 4th quarter",
+            ": 1st period", ": 2nd period", ": 3rd period",
+            ": 1st inning", ": first 5", ": 5 innings",
+            ": moneyline", ": spread", ": total",
+            ": first half", ": second half",
+            "1h moneyline", "2h moneyline",
+            "first half moneyline", "second half moneyline",
+            "first 5 innings",
         )
         if any(suf in title_lower for suf in DERIV_TITLE_SUFFIXES):
             return None
