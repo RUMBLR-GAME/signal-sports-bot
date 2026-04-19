@@ -66,6 +66,10 @@ class Position:
     # Bookmaker context (edge trades only — shows sharp-book pricing vs Polymarket)
     provider: str = ""           # e.g. "Bet365", "DraftKings"
     moneyline: int = 0           # American moneyline odds at entry (e.g. +150, -120)
+    # CLV (closing line value) — snapshot of book's line at kickoff, set by pre-game exit
+    # If positive: bookmaker line moved TOWARD our side → we had real alpha
+    clv_prob: Optional[float] = None
+    clv_snapshot_at: Optional[float] = None
 
 
 @dataclass
@@ -91,11 +95,45 @@ class Trade:
     true_prob: float = 0.0
     edge_at_entry: float = 0.0
     exit_reason: str = ""
+    # CLV for alpha tracking — copied from Position at exit time
+    provider: str = ""
+    entry_book_prob: float = 0.0     # book-implied prob at entry (for CLV calc)
+    clv_prob: Optional[float] = None  # book-implied prob at kickoff
+    clv_edge: Optional[float] = None  # entry_book_prob - clv_prob; positive = beat close
 
 
 def _safe_construct(cls, data: dict):
     valid = {f.name for f in dc_fields(cls)}
     return cls(**{k: v for k, v in data.items() if k in valid})
+
+
+def _ml_to_prob_safe(ml) -> float:
+    """American moneyline → implied probability (no de-vig). 0 for invalid input."""
+    if not ml:
+        return 0.0
+    try:
+        ml = int(ml)
+    except (TypeError, ValueError):
+        return 0.0
+    if ml == 0:
+        return 0.0
+    if ml > 0:
+        return round(100.0 / (ml + 100.0), 4)
+    return round(abs(ml) / (abs(ml) + 100.0), 4)
+
+
+def _calc_clv_edge(entry_ml, clv_prob) -> Optional[float]:
+    """
+    CLV edge = entry_book_prob - closing_book_prob.
+    Positive: we bet at a better price than the close → real alpha.
+    Negative: book moved away from us → we bet at the wrong side.
+    """
+    if clv_prob is None:
+        return None
+    entry_prob = _ml_to_prob_safe(entry_ml)
+    if entry_prob == 0:
+        return None
+    return round(entry_prob - clv_prob, 4)
 
 
 class PositionManager:
@@ -377,6 +415,10 @@ class PositionManager:
             opened_at=p.opened_at, closed_at=time.time(),
             score_line=p.score_line, true_prob=p.true_prob,
             edge_at_entry=p.edge_at_entry, exit_reason=reason,
+            provider=getattr(p, 'provider', ''),
+            entry_book_prob=_ml_to_prob_safe(getattr(p, 'moneyline', 0)),
+            clv_prob=getattr(p, 'clv_prob', None),
+            clv_edge=_calc_clv_edge(getattr(p, 'moneyline', 0), getattr(p, 'clv_prob', None)),
         )
         self.trades.append(trade)
         self.update_peak()
@@ -401,6 +443,10 @@ class PositionManager:
             opened_at=p.opened_at, closed_at=time.time(),
             score_line=p.score_line, true_prob=p.true_prob,
             edge_at_entry=p.edge_at_entry, exit_reason=reason,
+            provider=getattr(p, 'provider', ''),
+            entry_book_prob=_ml_to_prob_safe(getattr(p, 'moneyline', 0)),
+            clv_prob=getattr(p, 'clv_prob', None),
+            clv_edge=_calc_clv_edge(getattr(p, 'moneyline', 0), getattr(p, 'clv_prob', None)),
         ))
         del self.positions[p.id]
 
@@ -448,6 +494,41 @@ class PositionManager:
             if teams_match(home, p.team) or teams_match(away, p.team):
                 return True
         return False
+
+    def entries_for_game(self, home: str, away: str, engine: Optional[str] = None) -> int:
+        """
+        Count how many times we've OPENED a position on this game (including
+        positions that have since closed). Used for re-entry logic: we allow
+        up to 2 entries per game maximum.
+        """
+        from teams import teams_match
+        count = 0
+        # Count open positions
+        for p in self.positions.values():
+            if engine and p.engine != engine:
+                continue
+            if teams_match(home, p.team) or teams_match(away, p.team):
+                count += 1
+        # Count closed trades (different storage)
+        for t in self.trades:
+            if engine and t.engine != engine:
+                continue
+            if teams_match(home, t.team) or teams_match(away, t.team):
+                count += 1
+        return count
+
+    def last_exit_time_for_game(self, home: str, away: str, engine: Optional[str] = None) -> Optional[float]:
+        """Most recent exit timestamp for this game (for re-entry cooldown)."""
+        from teams import teams_match
+        latest = None
+        for t in self.trades:
+            if engine and t.engine != engine:
+                continue
+            if teams_match(home, t.team) or teams_match(away, t.team):
+                ct = getattr(t, 'closed_at', 0)
+                if latest is None or ct > latest:
+                    latest = ct
+        return latest
 
     def get_stale_orders(self, max_age_sec: float):
         now = time.time()

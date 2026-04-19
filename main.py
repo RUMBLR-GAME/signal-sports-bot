@@ -129,18 +129,26 @@ async def cancel_stale(clob, positions):
 
 # ─── Resolution ────────────────────────────────────────────────────────
 async def check_resolutions(clob, positions, bot_state):
+    """
+    Resolve positions on finished games. Two detection paths:
+    1. Gamma API reports market as closed/resolved — the ideal case.
+    2. Fallback: position held past its game_start + 6h AND Polymarket midpoint
+       has stabilized at near-0 or near-1 (market effectively settled).
+       This prevents positions sitting open for 14+ hours after game end.
+
+    Edge positions are normally exited at T-30 pre-game, but if that somehow
+    failed and the position is still open after the game, we clean it up here.
+    """
+    import time
+    now = time.time()
     for pos in [p for p in positions.get_open_positions() if p.status == "filled"]:
-        # Edge positions should exit before the game; skip them here.
-        if pos.engine == "edge":
-            continue
+        # Primary path: check if the market officially resolved.
         result = await clob.check_resolution(pos.condition_id)
         if result and result.get("resolved"):
             winner = result.get("winner", "UNKNOWN")
             yes_price = result.get("yes_price")
 
             # For named-outcome (2-way) sports markets, translate YES/NO to outcome.
-            # Polymarket returns "YES" when outcome_0 won. If our bet was on outcome_0,
-            # we won when YES. Otherwise we won when NO.
             if winner == "YES" and pos.outcome_idx == 0:
                 effective_winner = pos.bet_outcome
             elif winner == "NO" and pos.outcome_idx == 1:
@@ -151,6 +159,35 @@ async def check_resolutions(clob, positions, bot_state):
                 effective_winner = winner
             await positions.resolve_position(pos.id, effective_winner, yes_price=yes_price)
             _log_event(bot_state, f"Resolved {pos.team}: {winner}", engine="resolve")
+            continue
+
+        # Fallback: if the game started 6+ hours ago, the market MUST be decided.
+        # Use current mid to infer winner and force-resolve.
+        if pos.game_start_time:
+            start_ts = _ts_until_safe(pos.game_start_time)
+            if start_ts and (now - start_ts) > 6 * 3600:
+                mid = await clob.get_midpoint_http(pos.token_id)
+                if mid is None:
+                    mid = getattr(pos, "current_price", None) or pos.entry_price
+                # Snap to 0/1 based on threshold
+                if mid >= 0.95:
+                    # Our token won
+                    await positions.resolve_position(pos.id, pos.bet_outcome, yes_price=1.0)
+                    _log_event(bot_state, f"Fallback-resolved (won) {pos.team} @{mid:.3f}", engine="resolve")
+                elif mid <= 0.05:
+                    # Our token lost
+                    await positions.resolve_position(pos.id, "OTHER", yes_price=0.0)
+                    _log_event(bot_state, f"Fallback-resolved (lost) {pos.team} @{mid:.3f}", engine="resolve")
+                # else: price is ambiguous (0.05-0.95) — leave it, log next cycle
+
+
+def _ts_until_safe(dtstr: str):
+    """Parse ISO datetime string, return UNIX ts or None."""
+    try:
+        from datetime import datetime
+        return datetime.fromisoformat(dtstr.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
 
 
 # ─── Harvest partial exits ────────────────────────────────────────────
@@ -421,6 +458,14 @@ async def bot_loop(clob, positions, bot_state, sports_ws: SportsWS, market_ws: M
                     bot_state["odds_source_counts"] = e_odds_src
                     bot_state["oddsapi_league_diag"] = odds_api.get_league_diag()
 
+                    # Build latest_odds cache: {(home, away, date): {provider: GameOdds}}
+                    # Edge exit loop uses this to snapshot closing line value (CLV).
+                    latest_odds_cache = {}
+                    for o in all_odds:
+                        k = (o.home_team.lower(), o.away_team.lower(), o.commence_time[:10])
+                        latest_odds_cache.setdefault(k, {})[o.provider] = o
+                    bot_state["_latest_odds_cache"] = latest_odds_cache
+
                     if paused or not circuit_ok:
                         _log_event(bot_state, "Paused", engine="edge", level="warning")
                     else:
@@ -468,7 +513,8 @@ async def bot_loop(clob, positions, bot_state, sports_ws: SportsWS, market_ws: M
                 bot_state["last_edge_exit_run"] = now
                 bot_state["edge_exit_runs"] = bot_state.get("edge_exit_runs", 0) + 1
                 try:
-                    await check_edge_exits(clob, positions)
+                    latest_odds = bot_state.get("_latest_odds_cache") or None
+                    await check_edge_exits(clob, positions, latest_odds=latest_odds)
                     bot_state["last_edge_exit_ok"] = now
                 except Exception as e:
                     bot_state["last_edge_exit_err"] = str(e)[:200]

@@ -66,8 +66,8 @@ MAX_UNFILLED_AGE = _int("MAX_UNFILLED_AGE", 90)
 # v17 bug: capped at 60% of STARTING_BANKROLL forever → couldn't compound.
 # v18: percentages of CURRENT equity. Now actually compounds.
 MAX_TOTAL_EXPOSURE = _flt("MAX_TOTAL_EXPOSURE", 0.80)       # 80% of equity (matched with MAX_TOTAL_EXPOSURE_PCT)
-MAX_EDGE_EXPOSURE = _flt("MAX_EDGE_EXPOSURE", 0.40)         # 40% in Edge engine
-MAX_EXPOSURE_PER_SPORT = _flt("MAX_EXPOSURE_PER_SPORT", 0.40)   # 40% per sport
+MAX_EDGE_EXPOSURE = _flt("MAX_EDGE_EXPOSURE", 0.80)         # 80% in Edge engine (was 40%, raised now harvest is off)
+MAX_EXPOSURE_PER_SPORT = _flt("MAX_EXPOSURE_PER_SPORT", 0.50)   # 50% per sport
 MAX_EXPOSURE_PER_WINDOW = _flt("MAX_EXPOSURE_PER_WINDOW", 0.35) # 35% in any 4h window
 CORRELATION_WINDOW_HOURS = _flt("CORRELATION_WINDOW_HOURS", 4.0)
 
@@ -76,8 +76,9 @@ MIN_MARKET_LIQUIDITY = _flt("MIN_MARKET_LIQUIDITY", 500)
 MIN_DAILY_VOLUME = _flt("MIN_DAILY_VOLUME", 5000)
 
 # ─── KELLY ───────────────────────────────────────────────────────────────────
-KELLY_FRACTION = _flt("KELLY_FRACTION", 0.25)
+KELLY_FRACTION = _flt("KELLY_FRACTION", 0.50)
 MAX_POSITION_PCT = _flt("MAX_POSITION_PCT", 0.15)
+MAX_SINGLE_POSITION_PCT = _flt("MAX_SINGLE_POSITION_PCT", 0.25)  # hard ceiling AFTER all multipliers
 MIN_TRADE_SIZE = _flt("MIN_TRADE_SIZE", 2)
 
 # ─── DRAWDOWN GOVERNOR ───────────────────────────────────────────────────────
@@ -91,7 +92,7 @@ CIRCUIT_CONSECUTIVE_LOSSES = _int("CIRCUIT_CONSECUTIVE_LOSSES", 5)
 CIRCUIT_COOLDOWN_MIN = _int("CIRCUIT_COOLDOWN_MIN", 60)
 
 # ─── HARVEST ─────────────────────────────────────────────────────────────────
-HARVEST_ENABLED = _bool("HARVEST_ENABLED", True)
+HARVEST_ENABLED = _bool("HARVEST_ENABLED", False)  # DISABLED — not EV-positive at current thresholds
 HARVEST_MIN_CONFIDENCE = _flt("HARVEST_MIN_CONFIDENCE", 0.97)
 HARVEST_MAX_PRICE = _flt("HARVEST_MAX_PRICE", 0.97)
 HARVEST_MIN_PRICE = _flt("HARVEST_MIN_PRICE", 0.80)
@@ -100,7 +101,7 @@ HARVEST_MIN_EDGE = _flt("HARVEST_MIN_EDGE", 0.01)
 # Portfolio-wide caps: prevent the bot from deploying 100% of capital at once
 # and leaving nothing in reserve for better edges that appear later.
 MAX_TOTAL_EXPOSURE_PCT = _flt("MAX_TOTAL_EXPOSURE_PCT", 0.8)  # max 80% of bankroll in open positions (edge capped at 40% separately)
-MAX_OPEN_POSITIONS = int(_flt("MAX_OPEN_POSITIONS", 8))  # diversification cap
+MAX_OPEN_POSITIONS = int(_flt("MAX_OPEN_POSITIONS", 15))  # diversification cap
 # Partial exit: sell 50% when price reaches this level. Recycles capital.
 HARVEST_PARTIAL_EXIT_PRICE = _flt("HARVEST_PARTIAL_EXIT_PRICE", 0.985)
 HARVEST_PARTIAL_EXIT_FRAC = _flt("HARVEST_PARTIAL_EXIT_FRAC", 0.50)
@@ -112,15 +113,20 @@ NBA_MAX_CLOCK_Q4_SEC = _int("NBA_MAX_CLOCK_Q4_SEC", 360)
 
 # ─── EDGE FINDER ─────────────────────────────────────────────────────────────
 EDGE_ENABLED = _bool("EDGE_ENABLED", True)
-EDGE_MIN_EDGE = _flt("EDGE_MIN_EDGE", 0.05)
+EDGE_MIN_EDGE = _flt("EDGE_MIN_EDGE", 0.03)             # 3% — more flow, smaller edges
 EDGE_MAX_PRICE = _flt("EDGE_MAX_PRICE", 0.75)
 EDGE_MIN_PRICE = _flt("EDGE_MIN_PRICE", 0.25)
-EDGE_MIN_HOURS_BEFORE = _flt("EDGE_MIN_HOURS_BEFORE", 2)
-EDGE_MAX_HOURS_BEFORE = _flt("EDGE_MAX_HOURS_BEFORE", 48)
+EDGE_MIN_HOURS_BEFORE = _flt("EDGE_MIN_HOURS_BEFORE", 0.6)  # must be > pre-game exit window (30min)
+EDGE_MAX_HOURS_BEFORE = _flt("EDGE_MAX_HOURS_BEFORE", 72)   # 3-day look-ahead
 EDGE_EXIT_REMAINING = _flt("EDGE_EXIT_REMAINING", 0.02)
+EDGE_TAKE_PROFIT_PCT = _flt("EDGE_TAKE_PROFIT_PCT", 0.35)
 EDGE_STOP_LOSS = _flt("EDGE_STOP_LOSS", 0.05)
 EDGE_PRE_GAME_EXIT_MIN = _int("EDGE_PRE_GAME_EXIT_MIN", 30)
-EDGE_STALE_HOURS = _flt("EDGE_STALE_HOURS", 48)
+EDGE_STALE_HOURS = _flt("EDGE_STALE_HOURS", 18)
+EDGE_REENTRY_ENABLED = _bool("EDGE_REENTRY_ENABLED", True)   # allow 1 re-entry per game
+EDGE_REENTRY_COOLDOWN_MIN = _int("EDGE_REENTRY_COOLDOWN_MIN", 20)  # wait 20min before re-entering
+EDGE_SHARPNESS_PREMIUM = _flt("EDGE_SHARPNESS_PREMIUM", 1.5)   # size-up when Pinnacle+Bet365 agree
+EDGE_SHARPNESS_MIN_AGREE = _flt("EDGE_SHARPNESS_MIN_AGREE", 0.02)  # within 2¢ on both books
 
 # ─── ODDS API (odds-api.io — flag-gated) ─────────────────────────────────────
 # Free tier: 100 req/hour, 2 bookmakers chosen in user dashboard.
@@ -130,7 +136,7 @@ ODDS_API_ENABLED = _bool("ODDS_API_ENABLED", False) and bool(ODDS_API_KEY)
 ODDS_API_BASE = "https://api.odds-api.io/v3"
 # User's selected bookmakers in their odds-api.io dashboard. Free tier = 2.
 # Preference order: first match wins. Bet365 and DraftKings are the default.
-_bookmaker_csv = os.getenv("ODDS_API_BOOKMAKERS", "Bet365,DraftKings").strip()
+_bookmaker_csv = os.getenv("ODDS_API_BOOKMAKERS", "Pinnacle,Bet365").strip()
 ODDS_API_BOOKMAKERS = [b.strip() for b in _bookmaker_csv.split(",") if b.strip()]
 
 # ─── STALE MARKET PENALTY ────────────────────────────────────────────────────
@@ -262,9 +268,8 @@ _ODDS_API_FULL_MAP = {
     "ligamx": "mexico-liga-mx",
 }
 
-# Default = leagues CONFIRMED to have upcoming games as of 2026-04-17.
-# Override with ODDS_API_LEAGUES env var (comma-separated sport keys, or "all").
-_DEFAULT_ODDS_LEAGUES = "champ,aleag,erediv2,lig2fr,bund2,seriea,china,tur,allsv,ekstra"
+# Default = ALL verified leagues. Scan more = more opportunities.
+_DEFAULT_ODDS_LEAGUES = "all"
 _LEAGUE_FILTER = os.getenv("ODDS_API_LEAGUES", _DEFAULT_ODDS_LEAGUES).strip()
 if _LEAGUE_FILTER.lower() == "all":
     ODDS_API_LEAGUE_MAP = _ODDS_API_FULL_MAP

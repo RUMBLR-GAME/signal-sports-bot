@@ -25,6 +25,8 @@ from config import (
     EDGE_MIN_HOURS_BEFORE, EDGE_MAX_HOURS_BEFORE,
     EDGE_EXIT_REMAINING, EDGE_STOP_LOSS,
     EDGE_PRE_GAME_EXIT_MIN, EDGE_STALE_HOURS,
+    EDGE_REENTRY_ENABLED, EDGE_REENTRY_COOLDOWN_MIN,
+    EDGE_SHARPNESS_PREMIUM, EDGE_SHARPNESS_MIN_AGREE,
     MIN_MARKET_LIQUIDITY, MIN_DAILY_VOLUME,
     POLY_STALE_QUOTE_SEC, POLY_STALE_PENALTY,
     MAX_TOTAL_EXPOSURE_PCT, MAX_OPEN_POSITIONS, STARTING_BANKROLL,
@@ -113,7 +115,8 @@ async def scan_edge(
         "signals_generated": 0,
     }
 
-    # Group by sport. Prefer sharpest / non-duplicate provider per game.
+    # Group by sport. Within each sport, further group by game so we can
+    # compare multiple books' lines on the same match (sharpness signal).
     by_sport: dict = {}
     for o in all_odds:
         by_sport.setdefault(o.sport, []).append(o)
@@ -126,12 +129,20 @@ async def scan_edge(
             diag["skipped_no_polymarket_events"] += len(odds_list)
             continue
 
-        # Dedupe by game — pick sharpest provider available
+        # Group by (home, away, date) — all book quotes for one game
         preferred = ["Pinnacle", "Betfair", "Bet365", "ESPN BET", "FanDuel", "BetMGM"]
-        odds_list.sort(key=lambda o: preferred.index(o.provider) if o.provider in preferred else 99)
-        seen: set = set()
+        games: dict = {}  # game_key -> list of GameOdds
+        for o in odds_list:
+            k = (o.home_team.lower(), o.away_team.lower(), o.commence_time[:10])
+            games.setdefault(k, []).append(o)
+        # For each game, sort quotes by sharpness
+        for k in games:
+            games[k].sort(key=lambda o: preferred.index(o.provider) if o.provider in preferred else 99)
 
-        for odds in odds_list:
+        for game_key, all_books in games.items():
+            # Use the SHARPEST book as the primary truth (Pinnacle > Bet365 > others)
+            odds = all_books[0]
+
             # Portfolio-wide caps: don't add new positions when we're at exposure limit.
             open_cost = sum(
                 p.cost for p in positions.positions.values()
@@ -151,12 +162,6 @@ async def scan_edge(
                 diag["skipped_position_cap"] += 1
                 diag["_final_last"] = "position_cap_hit"
                 return signals, all_edges, diag
-
-            key = (odds.home_team.lower(), odds.away_team.lower(), odds.commence_time[:10])
-            if key in seen:
-                diag["skipped_duplicate_game"] += 1
-                continue
-            seen.add(key)
 
             hours = _hours_until(odds.commence_time)
             if hours is None or hours < EDGE_MIN_HOURS_BEFORE or hours > EDGE_MAX_HOURS_BEFORE:
@@ -194,23 +199,55 @@ async def scan_edge(
                 else:
                     diag["skipped_no_market_match"] += 1
                 continue
+
             # Check all condition_ids for this event (soccer has multiple —
             # home-win, away-win, draw are separate markets, must not trade both).
             cids_to_check = parsed.get("_condition_ids") or [parsed["condition_id"]]
             if any(positions.has_position_for(c) for c in cids_to_check):
                 diag["skipped_duplicate_condition"] += 1
                 continue
-            # Belt-and-braces: also reject if we already have an edge position
-            # on either team (same game = one bet maximum).
+
+            # Re-entry logic: allow up to 2 entries per game, but only after
+            # EDGE_REENTRY_COOLDOWN_MIN has passed since the last exit.
+            # Avoids buying-selling-buying on noise.
+            total_entries = positions.entries_for_game(
+                odds.home_team, odds.away_team, engine="edge"
+            )
+            max_entries = 2 if EDGE_REENTRY_ENABLED else 1
+            if total_entries >= max_entries:
+                diag["skipped_same_game_position"] += 1
+                continue
+            # If we already have an OPEN position, don't open another
             if positions.has_position_for_game(
                 odds.home_team, odds.away_team, engine="edge"
             ):
                 diag["skipped_same_game_position"] += 1
                 continue
+            # If this is a re-entry, enforce cooldown since last exit
+            if total_entries > 0:
+                last_exit = positions.last_exit_time_for_game(
+                    odds.home_team, odds.away_team, engine="edge"
+                )
+                if last_exit and (time.time() - last_exit) < EDGE_REENTRY_COOLDOWN_MIN * 60:
+                    diag["skipped_reentry_cooldown"] = diag.get("skipped_reentry_cooldown", 0) + 1
+                    continue
 
             hi = parsed["_home_idx"]
             ai = parsed["_away_idx"]
             stale = _market_is_stale(parsed)
+
+            # ── Multi-book sharpness signal ──
+            # If 2+ sharp books (Pinnacle/Bet365) agree on the price within
+            # EDGE_SHARPNESS_MIN_AGREE, that's a strong signal our edge is real
+            # (not one book being off). Apply EDGE_SHARPNESS_PREMIUM multiplier.
+            sharpness_mult = 1.0
+            agreeing_books = [odds.provider]
+            for alt in all_books[1:]:
+                if alt.provider in ("Pinnacle", "Bet365"):
+                    if abs(alt.home_prob - odds.home_prob) <= EDGE_SHARPNESS_MIN_AGREE:
+                        agreeing_books.append(alt.provider)
+            if len(agreeing_books) >= 2 and "Pinnacle" in agreeing_books:
+                sharpness_mult = EDGE_SHARPNESS_PREMIUM
 
             # Consult lineup watcher (if enabled) for team-news edge shift
             lineup_sig = None
@@ -330,13 +367,23 @@ async def scan_edge(
                         e["reason"] = sz_reason
                 continue
 
+            # Sharpness premium: multi-book agreement boosts size
+            if sharpness_mult > 1.0:
+                pre_premium = size
+                size = round(size * sharpness_mult, 2)
+                sz_reason += f" × sharpness {sharpness_mult:.2f} ({'+'.join(agreeing_books)})"
+                # Re-apply caps in case sharpness pushed us over
+                max_total = equity * 0.80  # MAX_TOTAL_EXPOSURE
+                current_deployed = positions.open_cost + sum(s.bet_size for s in signals)
+                size = min(size, max(0, max_total - current_deployed))
+
             # Mark best side as TRADED
             for e in all_edges:
                 if (e.get("team") == best["team"]
                     and e.get("commence_time") == odds.commence_time
                     and e.get("status") == "CANDIDATE"):
                     e["status"] = "TRADED"
-                    e["reason"] = f"bet ${size:.2f}"
+                    e["reason"] = f"bet ${size:.2f}" + (f" sharp×{sharpness_mult:.1f}" if sharpness_mult > 1 else "")
 
             signals.append(EdgeSignal(
                 sport=sport, espn_id=odds.espn_id,
@@ -364,14 +411,21 @@ async def scan_edge(
     return signals, all_edges[:300], diag
 
 
-async def check_edge_exits(clob: ClobInterface, positions: PositionManager):
+async def check_edge_exits(clob: ClobInterface, positions: PositionManager, latest_odds: Optional[dict] = None):
     """
-    Priority: pre-game exit > take-profit > stop-loss > stale.
-    Updates position mark-to-market prices along the way.
+    Priority:
+      1. Pre-game exit (T-30min) — lock in the edge before game risk.
+      2. Take profit: price moved ≥ EDGE_TAKE_PROFIT_PCT of the way from entry to true_prob.
+      3. Stop loss (EDGE_STOP_LOSS below entry).
+      4. Stale (held > EDGE_STALE_HOURS).
 
-    In paper mode (no authenticated CLOB client), clob.get_price returns None.
-    We fall back to the HTTP midpoint endpoint so exits still fire.
+    latest_odds: optional {(home_lower, away_lower, commence_date): {provider: GameOdds}}
+        cache of current bookmaker quotes. Used to snapshot Closing Line Value
+        at pre-game exit (measures true alpha).
+
+    In paper mode, clob.get_price returns None → fall back to HTTP midpoint.
     """
+    from config import EDGE_TAKE_PROFIT_PCT
     for pos in positions.get_filled_by_engine("edge"):
         # Try authenticated SELL price first (real fills at bid)
         current = await clob.get_price(pos.token_id, "SELL")
@@ -390,6 +444,7 @@ async def check_edge_exits(clob: ClobInterface, positions: PositionManager):
 
         entry = pos.fill_price or pos.entry_price
         age_hours = (time.time() - pos.opened_at) / 3600.0
+        age_min = age_hours * 60
 
         # 1. Pre-game exit — LOCK IN THE EDGE before game starts
         mins_to_game = None
@@ -398,14 +453,50 @@ async def check_edge_exits(clob: ClobInterface, positions: PositionManager):
             if start_ts is not None:
                 mins_to_game = (start_ts - time.time()) / 60.0
         if mins_to_game is not None and mins_to_game <= EDGE_PRE_GAME_EXIT_MIN:
+            # Snapshot CLV: lookup current book line for this game from latest_odds
+            # (if provided). This is the closing line — if the book moved toward
+            # our bet since entry, we beat the close = proven alpha.
+            if latest_odds and pos.provider:
+                try:
+                    # Parse commence date from game_start_time
+                    date_key = pos.game_start_time[:10] if pos.game_start_time else ""
+                    # Try to find this game's latest quote
+                    for key, book_dict in latest_odds.items():
+                        home_lc, away_lc, d = key
+                        # Fuzzy match — this token's team matches one side
+                        if d != date_key:
+                            continue
+                        if pos.team.lower() not in f"{home_lc} {away_lc}":
+                            continue
+                        # Found it — snapshot the book quote for our side
+                        provider_quote = book_dict.get(pos.provider)
+                        if provider_quote:
+                            # Which side are we on? outcome_idx=0 means home, 1 means away
+                            if pos.outcome_idx == 0:
+                                pos.clv_prob = provider_quote.home_prob
+                            else:
+                                pos.clv_prob = provider_quote.away_prob
+                            pos.clv_snapshot_at = time.time()
+                        break
+                except Exception as e:
+                    logger.debug(f"CLV snapshot failed for {pos.team}: {e}")
             await _do_exit(clob, positions, pos, current, f"pre_game (T-{mins_to_game:.0f}m)")
             continue
 
-        # 2. Take profit: remaining edge consumed
-        remaining_edge = pos.true_prob - current
-        if remaining_edge < EDGE_EXIT_REMAINING and current > entry:
-            await _do_exit(clob, positions, pos, current, f"take_profit (edge left {remaining_edge:.3f})")
-            continue
+        # 2. Take profit: captured ≥ N% of max possible edge
+        # Max edge = true_prob - entry (the full upside at position open).
+        # We take profit when realized gain ≥ EDGE_TAKE_PROFIT_PCT of that.
+        # Don't fire for at least 15 min after open — avoids WS noise exits.
+        max_edge = max(0.0, pos.true_prob - entry)
+        realized_edge = current - entry
+        if max_edge > 0 and age_min >= 15:
+            capture_pct = realized_edge / max_edge
+            if capture_pct >= EDGE_TAKE_PROFIT_PCT:
+                await _do_exit(
+                    clob, positions, pos, current,
+                    f"take_profit ({capture_pct:.0%} of max edge, {realized_edge*100:+.1f}¢)"
+                )
+                continue
 
         # 3. Stop loss
         if current < entry - EDGE_STOP_LOSS:

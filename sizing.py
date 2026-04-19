@@ -93,6 +93,13 @@ def compute_bet_size(
 
     raw_size = frac * equity
 
+    # HARD ceiling: even with full multipliers stacked (edge ladder × sleeping lion × sharpness),
+    # never bet more than 25% of equity on a single position. Protects against a single
+    # catastrophic outcome even when signal looks amazing.
+    from config import MAX_SINGLE_POSITION_PCT
+    hard_cap = equity * MAX_SINGLE_POSITION_PCT
+    raw_size = min(raw_size, hard_cap)
+
     # Helper to account for pending signals
     pending = pending_signals or []
     pending_total = sum(getattr(s, 'bet_size', 0) for s in pending)
