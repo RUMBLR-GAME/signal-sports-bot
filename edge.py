@@ -503,6 +503,19 @@ async def check_edge_exits(clob: ClobInterface, positions: PositionManager, late
                     f"take_profit ({capture_pct:.0%} of max edge, {realized_edge*100:+.1f}¢)"
                 )
                 continue
+            # EARLY take-profit for far-from-kickoff positions:
+            # If kickoff is >24h away AND we've captured 50%+ of max edge,
+            # lock it in. Edge convergence is not linear — the first 50%
+            # typically happens faster than the final 50%, and holding 24h+
+            # exposes us to reversal risk (lineup news, etc.).
+            if (mins_to_game is not None
+                and mins_to_game > 24 * 60
+                and capture_pct >= 0.50):
+                await _do_exit(
+                    clob, positions, pos, current,
+                    f"early_tp ({capture_pct:.0%} captured, T-{mins_to_game/60:.0f}h)"
+                )
+                continue
         # Fallback take-profit when true_prob wasn't set (legacy positions):
         # exit if we've gained 5¢ or more (substantial convergence).
         elif realized_edge >= 0.05 and age_min >= 3:
