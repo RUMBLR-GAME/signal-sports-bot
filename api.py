@@ -58,16 +58,41 @@ def create_api(positions: PositionManager, bot_state: dict, clob: ClobInterface 
                 "paused": bot_state.get("paused_until", 0) > time.time(),
                 "ws_sports_connected": bot_state.get("ws_sports_connected", False),
                 "ws_market_connected": bot_state.get("ws_market_connected", False),
+                # Build markers — if you see this, new exit code is deployed
+                "build": "v21-fast-exits-2h-fallback",
+                "build_features": [
+                    "extreme_price_exit_0.96",
+                    "extreme_loss_exit_0.04",
+                    "age_guard_3min",
+                    "take_profit_fallback_5c",
+                    "resolution_fallback_2h",
+                ],
             },
             headers=_cors_headers(req),
         )
 
     async def state(req):
         try:
+            import time as _time
+            now_ts = _time.time()
             # Open positions with mark-to-market
             open_pos = []
             for p in positions.get_open_positions():
                 mark = p.current_price if p.current_price is not None else p.entry_price
+                entry = p.fill_price or p.entry_price
+                age_min = (now_ts - p.opened_at) / 60.0
+                max_edge = max(0.0, (p.true_prob or 0) - entry)
+                realized = mark - entry
+                # Compute WHY this position is still open (for debugging)
+                why_open = []
+                if mark < 0.96 and mark > 0.04:
+                    why_open.append(f"price_mid({mark:.3f})")
+                if age_min < 3:
+                    why_open.append(f"age_too_new({age_min:.1f}m)")
+                if max_edge <= 0:
+                    why_open.append("no_max_edge")
+                elif realized / max_edge < 0.35:
+                    why_open.append(f"tp_at({realized/max_edge:.0%})")
                 open_pos.append({
                     "id": p.id, "engine": p.engine, "sport": p.sport,
                     "market": p.market_question,
@@ -81,6 +106,7 @@ def create_api(positions: PositionManager, bot_state: dict, clob: ClobInterface 
                     "true_prob": p.true_prob, "edge": p.edge_at_entry,
                     "status": p.status,
                     "opened_at": p.opened_at,
+                    "age_min": round(age_min, 1),
                     "last_mark_at": p.last_mark_at,
                     "game_start_time": p.game_start_time,
                     "partial_exits": p.partial_exits,
@@ -89,6 +115,7 @@ def create_api(positions: PositionManager, bot_state: dict, clob: ClobInterface 
                     "provider": p.provider,
                     "moneyline": p.moneyline,
                     "book_prob": _ml_to_prob(p.moneyline),
+                    "why_held": ", ".join(why_open) if why_open else "awaiting next exit cycle",
                 })
 
             history = []
@@ -303,10 +330,78 @@ def create_api(positions: PositionManager, bot_state: dict, clob: ClobInterface 
             "total_retained": len(bot_state.get("scan_history", [])),
         }, headers=_cors_headers(req))
 
-    for path in ["/api/state", "/health", "/api/pause", "/api/resume", "/api/reset", "/api/close-all", "/api/scans"]:
+    async def debug_exits(req):
+        """GET /api/debug/exits — dry-run the exit logic on every edge position and
+        return what WOULD happen. Useful for debugging 'positions not exiting'."""
+        from config import EDGE_TAKE_PROFIT_PCT, EDGE_STOP_LOSS, EDGE_STALE_HOURS, EDGE_PRE_GAME_EXIT_MIN
+        now_ts = time.time()
+        results = []
+        for p in positions.get_filled_by_engine("edge"):
+            # Fetch current price same way the exit loop does
+            current = None
+            if clob:
+                try:
+                    current = await clob.get_midpoint_http(p.token_id)
+                except Exception:
+                    current = None
+            if current is None:
+                current = getattr(p, "current_price", None) or p.entry_price
+            entry = p.fill_price or p.entry_price
+            age_min = (now_ts - p.opened_at) / 60.0
+            max_edge = max(0.0, (p.true_prob or 0) - entry)
+            realized = current - entry
+            # Run the same decision tree
+            decision = "HOLD"
+            reason = ""
+            mins_to_game = None
+            if p.game_start_time:
+                try:
+                    from datetime import datetime
+                    start_ts = datetime.fromisoformat(p.game_start_time.replace("Z", "+00:00")).timestamp()
+                    mins_to_game = (start_ts - now_ts) / 60.0
+                except Exception:
+                    pass
+            if mins_to_game is not None and mins_to_game <= EDGE_PRE_GAME_EXIT_MIN:
+                decision = "EXIT"; reason = f"pre_game T-{mins_to_game:.0f}m"
+            elif current >= 0.96 and current > entry:
+                decision = "EXIT"; reason = f"extreme_price @{current:.3f}"
+            elif current <= 0.04:
+                decision = "EXIT"; reason = f"extreme_loss @{current:.3f}"
+            elif max_edge > 0 and age_min >= 3 and realized / max_edge >= EDGE_TAKE_PROFIT_PCT:
+                decision = "EXIT"; reason = f"take_profit {realized/max_edge:.0%} of edge"
+            elif max_edge <= 0 and realized >= 0.05 and age_min >= 3:
+                decision = "EXIT"; reason = f"take_profit_fallback +{realized*100:.1f}c"
+            elif current < entry - EDGE_STOP_LOSS:
+                decision = "EXIT"; reason = f"stop_loss @{current:.3f}"
+            elif age_min > EDGE_STALE_HOURS * 60:
+                decision = "EXIT"; reason = f"stale {age_min:.0f}m"
+            else:
+                if age_min < 3: reason = f"age_guard ({age_min:.1f}m < 3m)"
+                elif max_edge > 0: reason = f"tp_progress {realized/max_edge:.0%} < 35%"
+                else: reason = "waiting for edge move"
+            results.append({
+                "id": p.id, "team": p.team, "sport": p.sport,
+                "entry": round(entry, 3), "current": round(current, 3),
+                "true_prob": round(p.true_prob or 0, 3),
+                "max_edge": round(max_edge, 3), "realized": round(realized, 3),
+                "age_min": round(age_min, 1), "mins_to_game": round(mins_to_game, 1) if mins_to_game is not None else None,
+                "decision": decision, "reason": reason,
+            })
+        return web.json_response({
+            "count": len(results),
+            "would_exit": sum(1 for r in results if r["decision"] == "EXIT"),
+            "last_edge_exit_run": bot_state.get("last_edge_exit_run"),
+            "last_edge_exit_ok": bot_state.get("last_edge_exit_ok"),
+            "last_edge_exit_err": bot_state.get("last_edge_exit_err"),
+            "edge_exit_runs": bot_state.get("edge_exit_runs", 0),
+            "positions": results,
+        }, headers=_cors_headers(req))
+
+    for path in ["/api/state", "/health", "/api/pause", "/api/resume", "/api/reset", "/api/close-all", "/api/scans", "/api/debug/exits"]:
         app.router.add_route("OPTIONS", path, options)
     app.router.add_route("GET", "/api/state", state)
     app.router.add_route("GET", "/api/scans", scans)
+    app.router.add_route("GET", "/api/debug/exits", debug_exits)
     app.router.add_route("GET", "/health", health)
     app.router.add_route("GET", "/", health)
     app.router.add_route("POST", "/api/pause", pause)
