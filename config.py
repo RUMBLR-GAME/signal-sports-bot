@@ -98,8 +98,15 @@ MIN_DAILY_VOLUME = _flt("MIN_DAILY_VOLUME", 5000)
 
 # ─── KELLY ───────────────────────────────────────────────────────────────────
 KELLY_FRACTION = _flt("KELLY_FRACTION", 0.50)
-MAX_POSITION_PCT = _flt("MAX_POSITION_PCT", 0.15)
-MAX_SINGLE_POSITION_PCT = _flt("MAX_SINGLE_POSITION_PCT", 0.25)  # hard ceiling AFTER all multipliers
+# MAX_POSITION_PCT: soft cap from Kelly formula — typical sizing target.
+# Research says 10% is the sweet spot for 80%+ win rate with fractional Kelly.
+# Above 0.25 Kelly (≈17% at our win rates), variance drag exceeds mean growth.
+MAX_POSITION_PCT = _flt("MAX_POSITION_PCT", 0.10)
+# MAX_SINGLE_POSITION_PCT: hard ceiling after ALL multipliers (sharpness premium,
+# edge ladder, sleeping lion). A single catastrophic outcome can't exceed this %.
+# Keeping 25% because exceptional signals (Pinnacle+Bet365 agree on 8%+ edge)
+# should be sized up — but league-day cap (40%) prevents stacking 4x of these.
+MAX_SINGLE_POSITION_PCT = _flt("MAX_SINGLE_POSITION_PCT", 0.25)
 MIN_TRADE_SIZE = _flt("MIN_TRADE_SIZE", 2)
 
 # ─── DRAWDOWN GOVERNOR ───────────────────────────────────────────────────────
