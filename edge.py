@@ -414,6 +414,8 @@ async def scan_edge(
 async def check_edge_exits(clob: ClobInterface, positions: PositionManager, latest_odds: Optional[dict] = None):
     """
     Priority:
+      0. Zombie cleanup — harvest positions when HARVEST_ENABLED=False
+         (orphaned from earlier runs; nothing else exits them).
       1. Pre-game exit (T-30min) — lock in the edge before game risk.
       2. Take profit: price moved ≥ EDGE_TAKE_PROFIT_PCT of the way from entry to true_prob.
       3. Stop loss (EDGE_STOP_LOSS below entry).
@@ -425,7 +427,22 @@ async def check_edge_exits(clob: ClobInterface, positions: PositionManager, late
 
     In paper mode, clob.get_price returns None → fall back to HTTP midpoint.
     """
-    from config import EDGE_TAKE_PROFIT_PCT
+    from config import EDGE_TAKE_PROFIT_PCT, HARVEST_ENABLED
+
+    # PRIORITY 0 — zombie harvest cleanup.
+    # When HARVEST_ENABLED=False, any leftover harvest positions have no code
+    # path that will ever close them. Force-exit at current mid. This also
+    # catches cross-engine orphans loaded from older state files.
+    if not HARVEST_ENABLED:
+        zombies = [p for p in positions.positions.values()
+                   if p.status in ("open", "filled") and p.engine != "edge"]
+        for pos in zombies:
+            current = await clob.get_midpoint_http(pos.token_id)
+            if current is None:
+                current = getattr(pos, "current_price", None) or pos.entry_price
+            await _do_exit(clob, positions, pos, current,
+                           f"zombie_cleanup (engine={pos.engine} disabled)")
+
     for pos in positions.get_filled_by_engine("edge"):
         # Try authenticated SELL price first (real fills at bid)
         current = await clob.get_price(pos.token_id, "SELL")
