@@ -128,6 +128,53 @@ EDGE_REENTRY_COOLDOWN_MIN = _int("EDGE_REENTRY_COOLDOWN_MIN", 20)  # wait 20min 
 EDGE_SHARPNESS_PREMIUM = _flt("EDGE_SHARPNESS_PREMIUM", 1.5)   # size-up when Pinnacle+Bet365 agree
 EDGE_SHARPNESS_MIN_AGREE = _flt("EDGE_SHARPNESS_MIN_AGREE", 0.02)  # within 2¢ on both books
 
+# ─── POLYMARKET FEES (introduced Feb 2026 for sports) ───────────────────────
+# Sports fee formula (April 2026): fee_rate = COEFFICIENT * price * (1 - price)
+# - At price=0.50, fee = 1.56%
+# - At price=0.90, fee = 0.56%
+# - At price=0.30, fee = 1.31%
+# Makers (limit orders that add liquidity) pay 0. Only takers (market orders) pay.
+POLYMARKET_FEE_COEFFICIENT = _flt("POLYMARKET_FEE_COEFFICIENT", 0.0625)  # sports only
+# Conservative slippage estimate for taker orders that cross multiple levels
+POLYMARKET_SLIPPAGE_BUFFER = _flt("POLYMARKET_SLIPPAGE_BUFFER", 0.002)  # 0.2%
+# Net edge threshold: raw edge MUST exceed (fee + slippage + min edge) to trade.
+# Setting EDGE_FEE_AWARE=True enforces this across edge + futures engines.
+EDGE_FEE_AWARE = _bool("EDGE_FEE_AWARE", True)
+
+# ─── MAKER/TAKER ORDER STRATEGY ──────────────────────────────────────────────
+# Maker orders earn 25% rebate on collected taker fees (pool redistribution).
+# Strategy: try maker first, fall back to taker if unfilled after N seconds.
+MAKER_FIRST_ENABLED = _bool("MAKER_FIRST_ENABLED", False)  # start disabled — needs testing
+MAKER_BID_OFFSET = _flt("MAKER_BID_OFFSET", 0.005)          # place bid 0.5¢ below current ask
+MAKER_FILL_TIMEOUT_SEC = _int("MAKER_FILL_TIMEOUT_SEC", 90) # if not filled in 90s, cancel + taker
+MAKER_MIN_EDGE_BONUS = _flt("MAKER_MIN_EDGE_BONUS", 0.005)  # only maker if edge > EDGE_MIN_EDGE + 0.5¢
+
+# ─── CLV VALIDATION GATE ─────────────────────────────────────────────────────
+# Require positive CLV over N resolved positions before allowing LIVE mode.
+# If paper CLV < threshold, bot refuses to trade in LIVE mode.
+# This forces 'prove the alpha on paper before risking real money'.
+CLV_GATE_ENABLED = _bool("CLV_GATE_ENABLED", True)
+CLV_GATE_MIN_SAMPLES = _int("CLV_GATE_MIN_SAMPLES", 30)  # need 30 resolved with CLV data
+CLV_GATE_MIN_AVG = _flt("CLV_GATE_MIN_AVG", 0.0)          # avg CLV must be ≥ 0
+CLV_GATE_BYPASS = _bool("CLV_GATE_BYPASS", False)          # emergency override
+
+# ─── FUTURES SCANNER ─────────────────────────────────────────────────────────
+# Scan Polymarket championship/tournament winner markets vs sharp books.
+# Source: Oracle practitioner: "futures markets often have teams trading 40%
+# below fair value because people hate holding exposure for months."
+FUTURES_ENABLED = _bool("FUTURES_ENABLED", False)
+FUTURES_SCAN_INTERVAL = _int("FUTURES_SCAN_INTERVAL", 1800)  # 30min — slow moving
+FUTURES_MIN_EDGE = _flt("FUTURES_MIN_EDGE", 0.08)            # 8% — higher bar than game-day
+FUTURES_MAX_POSITION_PCT = _flt("FUTURES_MAX_POSITION_PCT", 0.10)  # 10% max per future
+FUTURES_MAX_TOTAL_PCT = _flt("FUTURES_MAX_TOTAL_PCT", 0.30)        # 30% total capital in futures
+FUTURES_MIN_LIQUIDITY = _flt("FUTURES_MIN_LIQUIDITY", 5000)         # require $5k depth
+# Futures that exit via conditions:
+# - resolution_approaches: close out within N days before expected settlement
+# - line_converges: exit when market price rises to within Y of sharp line
+FUTURES_EXIT_DAYS_BEFORE = _int("FUTURES_EXIT_DAYS_BEFORE", 7)     # exit 7d before likely resolution
+FUTURES_CONVERGENCE_PCT = _flt("FUTURES_CONVERGENCE_PCT", 0.50)     # exit when 50% captured
+FUTURES_MAX_HOLD_DAYS = _int("FUTURES_MAX_HOLD_DAYS", 120)         # cap at 4mo even if no exit signal
+
 # ─── ODDS API (odds-api.io — flag-gated) ─────────────────────────────────────
 # Free tier: 100 req/hour, 2 bookmakers chosen in user dashboard.
 # /odds/multi batches 10 events per request — generous budget.

@@ -28,6 +28,15 @@ def _ml_to_prob(ml):
         ml = int(ml)
     except (TypeError, ValueError):
         return None
+
+
+def _clv_gate_status(positions):
+    """Lazy-import wrapper for CLV gate (avoids circular import at module load)."""
+    try:
+        from clv_gate import evaluate_clv_gate
+        return evaluate_clv_gate(positions)
+    except Exception:
+        return {"enabled": False, "passes": True, "reason": "gate unavailable"}
     if ml > 0:
         return round(100.0 / (ml + 100.0), 4)
     else:
@@ -194,6 +203,7 @@ def create_api(positions: PositionManager, bot_state: dict, clob: ClobInterface 
                     "edge_scan_diag": bot_state.get("edge_scan_diag", {}),
                     "odds_source_counts": bot_state.get("odds_source_counts", {}),
                     "oddsapi_league_diag": bot_state.get("oddsapi_league_diag", {}),
+                    "clv_gate": _clv_gate_status(positions),
                     "scan_history_summary": [
                         {
                             "id": s.get("id"),

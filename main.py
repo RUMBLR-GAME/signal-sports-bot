@@ -33,6 +33,7 @@ from clob import ClobInterface, parse_market_tokens
 from positions import PositionManager, Position
 from harvest import scan_harvest
 from edge import scan_edge, check_edge_exits
+from clv_gate import evaluate_clv_gate, live_mode_allowed, log_gate_status_on_startup
 from api import create_api
 from polymarket_ws import SportsWS, MarketWS
 from lineup_watcher import LineupWatcher
@@ -74,6 +75,15 @@ async def execute_signal(signal, clob: ClobInterface, positions: PositionManager
         return
     shares = round(bet / price, 2)
     if shares < 1:
+        return
+
+    # CLV GATE: in LIVE mode, refuse to place orders until paper CLV is validated.
+    # Paper mode bypasses this entirely (that's where we build the CLV record).
+    if not PAPER_MODE and not live_mode_allowed(positions):
+        status = evaluate_clv_gate(positions)
+        logger.warning(
+            f"SIGNAL BLOCKED (CLV gate): {signal.team} — {status['reason']}"
+        )
         return
 
     result = await clob.place_order(signal.token_id, price, shares, "BUY")
@@ -335,6 +345,7 @@ async def bot_loop(clob, positions, bot_state, sports_ws: SportsWS, market_ws: M
     logger.info(f"  Signal Harvest v18 — {'PAPER' if PAPER_MODE else 'LIVE'}")
     logger.info(f"  Bankroll: ${STARTING_BANKROLL:.2f}")
     logger.info(f"  Harvest={HARVEST_ENABLED}  Edge={EDGE_ENABLED}  OddsAPI={ODDS_API_ENABLED}")
+    log_gate_status_on_startup(positions)
     logger.info("=" * 55)
 
     # ESPN fetch cache — shared across harvest and edge scanners within a TTL

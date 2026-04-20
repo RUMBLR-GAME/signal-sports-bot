@@ -30,8 +30,29 @@ from config import (
     MIN_MARKET_LIQUIDITY, MIN_DAILY_VOLUME,
     POLY_STALE_QUOTE_SEC, POLY_STALE_PENALTY,
     MAX_TOTAL_EXPOSURE_PCT, MAX_OPEN_POSITIONS, STARTING_BANKROLL,
+    EDGE_FEE_AWARE, POLYMARKET_FEE_COEFFICIENT, POLYMARKET_SLIPPAGE_BUFFER,
 )
 from harvest import _market_is_stale
+
+
+def poly_taker_fee_rate(price: float) -> float:
+    """Compute Polymarket taker fee rate for a given share price.
+    Formula (April 2026 sports markets): rate = coeff * price * (1 - price)
+    Peaks at 50¢ (1.56%), drops to near-zero at extremes.
+    Returns 0 if fee awareness disabled (for legacy calibration).
+    """
+    if not EDGE_FEE_AWARE:
+        return 0.0
+    price = max(0.0, min(1.0, float(price)))
+    return POLYMARKET_FEE_COEFFICIENT * price * (1 - price)
+
+
+def net_edge_after_costs(raw_edge: float, price: float) -> float:
+    """Subtract taker fee + slippage buffer from raw edge to get net edge.
+    Use this for deciding whether a trade is actually profitable."""
+    if not EDGE_FEE_AWARE:
+        return raw_edge
+    return raw_edge - poly_taker_fee_rate(price) - POLYMARKET_SLIPPAGE_BUFFER
 
 logger = logging.getLogger("edge")
 
@@ -295,10 +316,18 @@ async def scan_edge(
 
             # Log ALL edges for diagnostics
             for se in side_edges:
+                # Compute net edge after fees + slippage (for decision)
+                se["net_edge"] = net_edge_after_costs(se["eff_edge"], se["poly_price"])
+                se["fee_cost"] = poly_taker_fee_rate(se["poly_price"])
                 # Tag each side with its eventual disposition
-                if se["eff_edge"] < EDGE_MIN_EDGE:
+                if se["net_edge"] < EDGE_MIN_EDGE:
                     status = "SKIP_LOW_EDGE"
-                    reason = f"edge {se['eff_edge']:.3f} < min {EDGE_MIN_EDGE:.2f}"
+                    if EDGE_FEE_AWARE:
+                        reason = (f"net_edge {se['net_edge']:.3f} < min {EDGE_MIN_EDGE:.2f} "
+                                  f"(raw {se['eff_edge']:.3f} − fee {se['fee_cost']:.3f} "
+                                  f"− slip {POLYMARKET_SLIPPAGE_BUFFER:.3f})")
+                    else:
+                        reason = f"edge {se['eff_edge']:.3f} < min {EDGE_MIN_EDGE:.2f}"
                 elif se["poly_price"] < EDGE_MIN_PRICE:
                     status = "SKIP_PRICE_LOW"
                     reason = f"price {se['poly_price']:.3f} < min {EDGE_MIN_PRICE:.2f}"
@@ -312,6 +341,8 @@ async def scan_edge(
                     "team": se["team"], "sport": sport,
                     "poly": se["poly_price"], "true": se["true_prob"],
                     "edge": se["raw_edge"], "effective_edge": se["eff_edge"],
+                    "net_edge": round(se["net_edge"], 4),
+                    "fee_cost": round(se["fee_cost"], 4),
                     "provider": odds.provider, "moneyline": se["ml"],
                     "hours": round(hours, 1),
                     "stale": stale,
@@ -323,12 +354,12 @@ async def scan_edge(
                     "reason": reason,
                 })
 
-            # Pick only the side with LARGEST effective edge
-            tradable = [se for se in side_edges if se["eff_edge"] >= EDGE_MIN_EDGE
+            # Pick only the side with LARGEST NET edge (after fees)
+            tradable = [se for se in side_edges if se["net_edge"] >= EDGE_MIN_EDGE
                         and EDGE_MIN_PRICE <= se["poly_price"] <= EDGE_MAX_PRICE]
             if not tradable:
                 continue
-            best = max(tradable, key=lambda x: x["eff_edge"])
+            best = max(tradable, key=lambda x: x["net_edge"])
 
             # Mark the non-best side as SKIP_NOT_BEST if both passed
             for e in all_edges:
