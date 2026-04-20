@@ -454,24 +454,17 @@ async def check_edge_exits(clob: ClobInterface, positions: PositionManager, late
                 mins_to_game = (start_ts - time.time()) / 60.0
         if mins_to_game is not None and mins_to_game <= EDGE_PRE_GAME_EXIT_MIN:
             # Snapshot CLV: lookup current book line for this game from latest_odds
-            # (if provided). This is the closing line — if the book moved toward
-            # our bet since entry, we beat the close = proven alpha.
             if latest_odds and pos.provider:
                 try:
-                    # Parse commence date from game_start_time
                     date_key = pos.game_start_time[:10] if pos.game_start_time else ""
-                    # Try to find this game's latest quote
                     for key, book_dict in latest_odds.items():
                         home_lc, away_lc, d = key
-                        # Fuzzy match — this token's team matches one side
                         if d != date_key:
                             continue
                         if pos.team.lower() not in f"{home_lc} {away_lc}":
                             continue
-                        # Found it — snapshot the book quote for our side
                         provider_quote = book_dict.get(pos.provider)
                         if provider_quote:
-                            # Which side are we on? outcome_idx=0 means home, 1 means away
                             if pos.outcome_idx == 0:
                                 pos.clv_prob = provider_quote.home_prob
                             else:
@@ -483,13 +476,26 @@ async def check_edge_exits(clob: ClobInterface, positions: PositionManager, late
             await _do_exit(clob, positions, pos, current, f"pre_game (T-{mins_to_game:.0f}m)")
             continue
 
+        # 1b. EXTREME PRICE — market has effectively resolved, exit NOW
+        # If current price is >= 0.96, the market is pricing this as certain.
+        # Waiting longer adds zero EV and just ties up capital.
+        if current >= 0.96 and current > entry:
+            await _do_exit(clob, positions, pos, current,
+                           f"extreme_price (converged @{current:.3f})")
+            continue
+        # If current <= 0.04, the other side won. Exit for scrap.
+        if current <= 0.04:
+            await _do_exit(clob, positions, pos, current,
+                           f"extreme_loss (resolved @{current:.3f})")
+            continue
+
         # 2. Take profit: captured ≥ N% of max possible edge
         # Max edge = true_prob - entry (the full upside at position open).
         # We take profit when realized gain ≥ EDGE_TAKE_PROFIT_PCT of that.
-        # Don't fire for at least 15 min after open — avoids WS noise exits.
+        # 3-min hold prevents WS noise exits immediately after open.
         max_edge = max(0.0, pos.true_prob - entry)
         realized_edge = current - entry
-        if max_edge > 0 and age_min >= 15:
+        if max_edge > 0 and age_min >= 3:
             capture_pct = realized_edge / max_edge
             if capture_pct >= EDGE_TAKE_PROFIT_PCT:
                 await _do_exit(
@@ -497,6 +503,14 @@ async def check_edge_exits(clob: ClobInterface, positions: PositionManager, late
                     f"take_profit ({capture_pct:.0%} of max edge, {realized_edge*100:+.1f}¢)"
                 )
                 continue
+        # Fallback take-profit when true_prob wasn't set (legacy positions):
+        # exit if we've gained 5¢ or more (substantial convergence).
+        elif realized_edge >= 0.05 and age_min >= 3:
+            await _do_exit(
+                clob, positions, pos, current,
+                f"take_profit_fallback (+{realized_edge*100:.1f}¢)"
+            )
+            continue
 
         # 3. Stop loss
         if current < entry - EDGE_STOP_LOSS:

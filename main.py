@@ -161,24 +161,22 @@ async def check_resolutions(clob, positions, bot_state):
             _log_event(bot_state, f"Resolved {pos.team}: {winner}", engine="resolve")
             continue
 
-        # Fallback: if the game started 6+ hours ago, the market MUST be decided.
-        # Use current mid to infer winner and force-resolve.
+        # Fallback: if the game started 2+ hours ago, the market MUST be decided.
+        # Use current mid to infer winner and force-resolve. Previously 6h but
+        # that was too slow — positions sat open tying up capital.
         if pos.game_start_time:
             start_ts = _ts_until_safe(pos.game_start_time)
-            if start_ts and (now - start_ts) > 6 * 3600:
+            if start_ts and (now - start_ts) > 2 * 3600:
                 mid = await clob.get_midpoint_http(pos.token_id)
                 if mid is None:
                     mid = getattr(pos, "current_price", None) or pos.entry_price
                 # Snap to 0/1 based on threshold
                 if mid >= 0.95:
-                    # Our token won
                     await positions.resolve_position(pos.id, pos.bet_outcome, yes_price=1.0)
                     _log_event(bot_state, f"Fallback-resolved (won) {pos.team} @{mid:.3f}", engine="resolve")
                 elif mid <= 0.05:
-                    # Our token lost
                     await positions.resolve_position(pos.id, "OTHER", yes_price=0.0)
                     _log_event(bot_state, f"Fallback-resolved (lost) {pos.team} @{mid:.3f}", engine="resolve")
-                # else: price is ambiguous (0.05-0.95) — leave it, log next cycle
 
 
 def _ts_until_safe(dtstr: str):
