@@ -538,7 +538,12 @@ class PositionManager:
         return [p for p in self.positions.values() if p.status in ("open", "filled")]
 
     def get_filled_by_engine(self, engine: str):
-        return [p for p in self.positions.values() if p.status == "filled" and p.engine == engine]
+        # Include both 'open' (pre-fill orders) and 'filled' (confirmed fills).
+        # In paper mode, positions are marked 'filled' immediately, but positions
+        # loaded from older state files may still be 'open' — they still need
+        # exit processing.
+        return [p for p in self.positions.values()
+                if p.status in ("open", "filled") and p.engine == engine]
 
     def deployed_by_sport(self, sport: str) -> float:
         return sum(p.cost for p in self.get_open_positions() if p.sport == sport)

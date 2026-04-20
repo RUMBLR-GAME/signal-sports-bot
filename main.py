@@ -141,7 +141,7 @@ async def check_resolutions(clob, positions, bot_state):
     """
     import time
     now = time.time()
-    for pos in [p for p in positions.get_open_positions() if p.status == "filled"]:
+    for pos in positions.get_open_positions():  # already filters open+filled
         # Primary path: check if the market officially resolved.
         result = await clob.check_resolution(pos.condition_id)
         if result and result.get("resolved"):
