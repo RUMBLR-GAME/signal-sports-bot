@@ -70,6 +70,10 @@ class Position:
     # If positive: bookmaker line moved TOWARD our side → we had real alpha
     clv_prob: Optional[float] = None
     clv_snapshot_at: Optional[float] = None
+    # Maker vs taker tracking — lets us measure maker-first strategy effectiveness.
+    # 'maker' = filled as maker (0 fee + rebate), 'taker' = fell back to FOK (paid fee),
+    # 'maker_only' = legacy GTC post_only path, 'unknown' = paper
+    fill_mode: str = "unknown"
 
 
 @dataclass
@@ -100,6 +104,8 @@ class Trade:
     entry_book_prob: float = 0.0     # book-implied prob at entry (for CLV calc)
     clv_prob: Optional[float] = None  # book-implied prob at kickoff
     clv_edge: Optional[float] = None  # entry_book_prob - clv_prob; positive = beat close
+    # Fill economics
+    fill_mode: str = "unknown"       # 'maker' | 'taker' | 'maker_only' | 'unknown'
 
 
 def _safe_construct(cls, data: dict):
@@ -419,6 +425,7 @@ class PositionManager:
             entry_book_prob=_ml_to_prob_safe(getattr(p, 'moneyline', 0)),
             clv_prob=getattr(p, 'clv_prob', None),
             clv_edge=_calc_clv_edge(getattr(p, 'moneyline', 0), getattr(p, 'clv_prob', None)),
+            fill_mode=getattr(p, 'fill_mode', 'unknown'),
         )
         self.trades.append(trade)
         self.update_peak()
@@ -447,6 +454,7 @@ class PositionManager:
             entry_book_prob=_ml_to_prob_safe(getattr(p, 'moneyline', 0)),
             clv_prob=getattr(p, 'clv_prob', None),
             clv_edge=_calc_clv_edge(getattr(p, 'moneyline', 0), getattr(p, 'clv_prob', None)),
+            fill_mode=getattr(p, 'fill_mode', 'unknown'),
         ))
         del self.positions[p.id]
 

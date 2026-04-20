@@ -28,6 +28,8 @@ from config import (
     EDGE_MIN_EDGE, HARVEST_ENABLED, EDGE_ENABLED,
     ODDS_API_ENABLED, SCAN_LOG_MAX,
     HARVEST_PARTIAL_EXIT_PRICE, HARVEST_PARTIAL_EXIT_FRAC,
+    MAKER_FIRST_ENABLED, MAKER_BID_OFFSET, MAKER_FILL_TIMEOUT_SEC,
+    MAKER_MIN_EDGE_BONUS,
 )
 from clob import ClobInterface, parse_market_tokens
 from positions import PositionManager, Position
@@ -86,7 +88,36 @@ async def execute_signal(signal, clob: ClobInterface, positions: PositionManager
         )
         return
 
-    result = await clob.place_order(signal.token_id, price, shares, "BUY")
+    # MAKER-FIRST STRATEGY (v21+):
+    # When enabled AND signal edge is healthy enough to survive a 0.5¢ worse fill,
+    # place a limit order 0.5¢ below taker price to earn maker rebate (no fee).
+    # Fall back to FOK taker if maker doesn't fill within timeout.
+    # Skipped for:
+    #  - small edges (not enough headroom to give up 0.5¢)
+    #  - exit orders (handled separately in edge.py exit loop)
+    #  - paper mode (no real fills to chase)
+    use_maker_first = (
+        MAKER_FIRST_ENABLED
+        and not PAPER_MODE
+        and getattr(signal, "edge", 0) >= (EDGE_MIN_EDGE + MAKER_MIN_EDGE_BONUS)
+    )
+    if use_maker_first:
+        result = await clob.place_order_maker_first(
+            signal.token_id, price, shares, "BUY",
+            maker_offset=MAKER_BID_OFFSET,
+            timeout_sec=MAKER_FILL_TIMEOUT_SEC,
+        )
+        fill_mode = result.get("fill_mode", "unknown") if result else "none"
+        if result:
+            # Adjust entry price if maker filled at better price than signal expected
+            if fill_mode == "maker":
+                maker_fill = result.get("fill_price", price)
+                if maker_fill and maker_fill > 0:
+                    price = maker_fill  # we got filled cheaper than the signal price
+    else:
+        result = await clob.place_order(signal.token_id, price, shares, "BUY")
+        fill_mode = "maker_only"  # current default (GTC post_only)
+
     if not result:
         return
 
@@ -112,6 +143,7 @@ async def execute_signal(signal, clob: ClobInterface, positions: PositionManager
         espn_id=getattr(signal, "espn_id", ""),
         provider=getattr(signal, "provider", ""),
         moneyline=getattr(signal, "moneyline", 0),
+        fill_mode=fill_mode,
     )
     if PAPER_MODE:
         pos.fill_price = price

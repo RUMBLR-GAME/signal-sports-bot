@@ -236,6 +236,123 @@ class ClobInterface:
             logger.error(f"place_order: {e}")
             return None
 
+    async def place_order_fok(
+        self, token_id: str, price: float, size: float, side: str = "BUY"
+    ) -> Optional[dict]:
+        """Submit a Fill-Or-Kill market order (TAKER). Pays the fee.
+        Falls back here when a maker order doesn't fill before timeout.
+        """
+        if not self._authenticated:
+            logger.info(f"[PAPER] {side} FOK {size:.1f}@{price:.3f}")
+            return {"orderID": f"paper-fok-{int(time.time()*1000)}", "paper": True, "filled": True}
+
+        if not self._check_rate_limit():
+            logger.warning("rate limit")
+            return None
+
+        def _place():
+            from py_clob_client.clob_types import OrderArgs, OrderType, PartialCreateOrderOptions
+            from py_clob_client.order_builder.constants import BUY, SELL
+            tick_size = self._client.get_tick_size(token_id)
+            options = PartialCreateOrderOptions(tick_size=tick_size)
+            p = round(price / tick_size) * tick_size
+            order_args = OrderArgs(
+                token_id=token_id, price=p, size=size,
+                side=BUY if side == "BUY" else SELL,
+            )
+            signed = self._client.create_order(order_args, options)
+            # FOK = Fill-or-Kill: entire order fills at this price or nothing
+            # post_only=False means we're a taker — we cross the book
+            return self._client.post_order(signed, OrderType.FOK, post_only=False)
+
+        try:
+            result = await asyncio.to_thread(_place)
+            self._order_timestamps.append(time.time())
+            logger.info(f"FOK order: {side} {size}@{price:.3f} → {result.get('orderID','?')}")
+            return result
+        except Exception as e:
+            logger.error(f"place_order_fok: {e}")
+            return None
+
+    async def get_order_status(self, order_id: str) -> Optional[dict]:
+        """Fetch current status of a specific order. Returns None on error.
+        Status values from py-clob-client: 'LIVE', 'MATCHED', 'CANCELLED', etc.
+        """
+        if not self._authenticated or not order_id or order_id.startswith("paper"):
+            return None
+        try:
+            resp = await asyncio.to_thread(self._client.get_order, order_id)
+            return resp if isinstance(resp, dict) else None
+        except Exception as e:
+            logger.debug(f"get_order_status: {e}")
+            return None
+
+    async def place_order_maker_first(
+        self, token_id: str, price: float, size: float, side: str = "BUY",
+        maker_offset: float = 0.005, timeout_sec: int = 90, poll_sec: int = 10,
+    ) -> Optional[dict]:
+        """Try to fill as maker first (0 fee + rebate), fall back to taker (FOK) if unfilled.
+
+        Args:
+            token_id: market token
+            price: target fill price (taker price — the price we'd pay if we crossed book)
+            size: shares desired
+            side: BUY or SELL
+            maker_offset: how far inside the spread to place our limit (default 0.5¢)
+            timeout_sec: give up on maker fill after N seconds
+            poll_sec: check fill status every N seconds
+
+        Returns: dict with fill info, or None if both paths fail.
+        Adds 'fill_mode' = 'maker' | 'taker' | 'none' so caller knows what happened.
+        """
+        # Maker price: better for us than the taker price (lower when buying, higher when selling)
+        if side == "BUY":
+            maker_price = max(0.01, price - maker_offset)
+        else:
+            maker_price = min(0.99, price + maker_offset)
+
+        # 1. Try maker first
+        maker_result = await self.place_order(token_id, maker_price, size, side)
+        if not maker_result:
+            logger.info(f"maker-first: maker submission failed, going direct taker")
+            taker = await self.place_order_fok(token_id, price, size, side)
+            if taker:
+                taker["fill_mode"] = "taker"
+            return taker
+
+        order_id = maker_result.get("orderID")
+        if not order_id or str(order_id).startswith("paper"):
+            # Paper mode — pretend it filled at maker price instantly
+            maker_result["fill_mode"] = "maker"
+            maker_result["fill_price"] = maker_price
+            return maker_result
+
+        # 2. Poll for maker fill
+        deadline = time.time() + timeout_sec
+        while time.time() < deadline:
+            await asyncio.sleep(poll_sec)
+            status = await self.get_order_status(order_id)
+            if not status:
+                continue
+            status_name = str(status.get("status", "")).upper()
+            if status_name in ("MATCHED", "FILLED"):
+                logger.info(f"maker-first: MAKER FILL {order_id} @{maker_price:.3f}")
+                maker_result["fill_mode"] = "maker"
+                maker_result["fill_price"] = maker_price
+                return maker_result
+            if status_name in ("CANCELLED", "REJECTED", "EXPIRED"):
+                logger.info(f"maker-first: order {status_name}, falling to taker")
+                break
+
+        # 3. Timeout — cancel maker order, fall through to taker
+        await self.cancel_order(order_id)
+        logger.info(f"maker-first: MAKER TIMEOUT after {timeout_sec}s, falling to taker")
+        taker = await self.place_order_fok(token_id, price, size, side)
+        if taker:
+            taker["fill_mode"] = "taker"
+            taker["fill_price"] = price
+        return taker
+
     async def cancel_order(self, order_id: str) -> bool:
         if not self._authenticated:
             return True
