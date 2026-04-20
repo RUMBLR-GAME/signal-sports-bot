@@ -15,6 +15,7 @@ from config import (
     KELLY_FRACTION, MAX_POSITION_PCT, MIN_TRADE_SIZE,
     MAX_TOTAL_EXPOSURE, MAX_EDGE_EXPOSURE,
     MAX_EXPOSURE_PER_SPORT, MAX_EXPOSURE_PER_WINDOW,
+    MAX_EXPOSURE_PER_LEAGUE_DAY,
     SPORT_RISK_MULTIPLIER, SLEEPING_LION, EDGE_SIZE_LADDER,
     DRAWDOWN_THRESHOLD, DRAWDOWN_KELLY_MULT,
 )
@@ -140,6 +141,17 @@ def compute_bet_size(
         if window_room <= 0:
             return 0.0, f"time-window cap (${window_open:.0f}/${window_cap:.0f})"
         size = min(size, window_room)
+
+    # Per-league-day cap — stops stacking 4x Saturday Championship bets.
+    # Same league on same calendar day moves together on one news event (weather,
+    # referee appointments, league-wide VAR changes, slate-wide sharp action).
+    if sport and game_start_ts is not None:
+        ld_cap = equity * MAX_EXPOSURE_PER_LEAGUE_DAY
+        ld_open = positions.deployed_by_league_day(sport, game_start_ts) + pending_by_sport
+        ld_room = ld_cap - ld_open
+        if ld_room <= 0:
+            return 0.0, f"league-day cap {sport} (${ld_open:.0f}/${ld_cap:.0f})"
+        size = min(size, ld_room)
 
     if size < MIN_TRADE_SIZE:
         return 0.0, f"size ${size:.2f} < min ${MIN_TRADE_SIZE}"

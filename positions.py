@@ -556,6 +556,33 @@ class PositionManager:
     def deployed_by_sport(self, sport: str) -> float:
         return sum(p.cost for p in self.get_open_positions() if p.sport == sport)
 
+    def deployed_by_league_day(self, sport: str, anchor_ts: Optional[float]) -> float:
+        """Sum $ deployed on a given sport+calendar-day. Defends against stacking 4x
+        Championship Saturday bets that all move together on one news event.
+
+        anchor_ts is the kickoff time of the candidate bet — we compare UTC dates."""
+        if not sport or anchor_ts is None:
+            return 0.0
+        from datetime import datetime, timezone
+        try:
+            anchor_date = datetime.fromtimestamp(anchor_ts, tz=timezone.utc).date()
+        except (OSError, ValueError, OverflowError):
+            return 0.0
+        total = 0.0
+        for p in self.get_open_positions():
+            if p.sport != sport:
+                continue
+            p_ts = self._parse_start_ts(p.game_start_time) or p.opened_at
+            if p_ts is None:
+                continue
+            try:
+                p_date = datetime.fromtimestamp(p_ts, tz=timezone.utc).date()
+            except (OSError, ValueError, OverflowError):
+                continue
+            if p_date == anchor_date:
+                total += p.cost
+        return total
+
     def deployed_in_window(self, anchor_ts: Optional[float], window_hours: float = None) -> float:
         if anchor_ts is None:
             return 0.0

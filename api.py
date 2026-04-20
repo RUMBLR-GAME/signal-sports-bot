@@ -28,6 +28,10 @@ def _ml_to_prob(ml):
         ml = int(ml)
     except (TypeError, ValueError):
         return None
+    if ml > 0:
+        return round(100.0 / (ml + 100.0), 4)
+    else:
+        return round(abs(ml) / (abs(ml) + 100.0), 4)
 
 
 def _clv_gate_status(positions):
@@ -37,10 +41,6 @@ def _clv_gate_status(positions):
         return evaluate_clv_gate(positions)
     except Exception:
         return {"enabled": False, "passes": True, "reason": "gate unavailable"}
-    if ml > 0:
-        return round(100.0 / (ml + 100.0), 4)
-    else:
-        return round(abs(ml) / (abs(ml) + 100.0), 4)
 
 
 def _cors_headers(req):

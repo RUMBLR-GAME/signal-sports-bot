@@ -30,11 +30,13 @@ from config import (
     HARVEST_PARTIAL_EXIT_PRICE, HARVEST_PARTIAL_EXIT_FRAC,
     MAKER_FIRST_ENABLED, MAKER_BID_OFFSET, MAKER_FILL_TIMEOUT_SEC,
     MAKER_MIN_EDGE_BONUS,
+    FUTURES_ENABLED, FUTURES_SCAN_INTERVAL,
 )
 from clob import ClobInterface, parse_market_tokens
 from positions import PositionManager, Position
 from harvest import scan_harvest
 from edge import scan_edge, check_edge_exits
+from futures import scan_futures, check_futures_exits
 from clv_gate import evaluate_clv_gate, live_mode_allowed, log_gate_status_on_startup
 from api import create_api
 from polymarket_ws import SportsWS, MarketWS
@@ -369,6 +371,7 @@ async def bot_loop(clob, positions, bot_state, sports_ws: SportsWS, market_ws: M
     last = {
         "harvest": 0.0, "edge_scan": 0.0, "edge_exit": 0.0,
         "resolve": 0.0, "partials": 0.0, "equity": 0.0,
+        "futures_scan": 0.0, "futures_exit": 0.0,
     }
     scans = 0
     shared_session: aiohttp.ClientSession = bot_state["session"]
@@ -560,6 +563,31 @@ async def bot_loop(clob, positions, bot_state, sports_ws: SportsWS, market_ws: M
                 except Exception as e:
                     bot_state["last_edge_exit_err"] = str(e)[:200]
                     logger.error(f"edge exit: {e}", exc_info=True)
+
+            # FUTURES scan (every 30min — slow-moving markets)
+            if FUTURES_ENABLED and now - last.get("futures_scan", 0) >= FUTURES_SCAN_INTERVAL:
+                last["futures_scan"] = now
+                bot_state["last_futures_scan"] = now
+                try:
+                    if paused or not circuit_ok:
+                        pass  # respect circuit breaker
+                    else:
+                        f_signals, f_diag = await scan_futures(clob, positions, shared_session)
+                        bot_state["futures_scan_diag"] = f_diag
+                        for s in f_signals:
+                            await execute_signal(s, clob, positions)
+                except Exception as e:
+                    logger.error(f"futures scan: {e}", exc_info=True)
+
+            # FUTURES exits (every 60min — no need to poll faster)
+            if FUTURES_ENABLED and now - last.get("futures_exit", 0) >= 3600:
+                last["futures_exit"] = now
+                try:
+                    n = await check_futures_exits(clob, positions)
+                    if n > 0:
+                        logger.info(f"futures exits: {n} position(s) closed")
+                except Exception as e:
+                    logger.error(f"futures exit: {e}", exc_info=True)
 
             # HARVEST partials (every 60s)
             if HARVEST_ENABLED and now - last["partials"] >= PARTIAL_CHECK_INTERVAL:

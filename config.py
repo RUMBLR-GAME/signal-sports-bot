@@ -70,6 +70,27 @@ MAX_EDGE_EXPOSURE = _flt("MAX_EDGE_EXPOSURE", 0.80)         # 80% in Edge engine
 MAX_EXPOSURE_PER_SPORT = _flt("MAX_EXPOSURE_PER_SPORT", 0.50)   # 50% per sport
 MAX_EXPOSURE_PER_WINDOW = _flt("MAX_EXPOSURE_PER_WINDOW", 0.35) # 35% in any 4h window
 CORRELATION_WINDOW_HOURS = _flt("CORRELATION_WINDOW_HOURS", 4.0)
+# NEW v22: Per-league-per-day cap. Stops "4 Championship Saturday games at 25% each = 100%".
+# A single news event (weather, referee, VAR rules change) can move all games in a league-day
+# together. This is the most dangerous correlation and isn't captured by time-window alone.
+MAX_EXPOSURE_PER_LEAGUE_DAY = _flt("MAX_EXPOSURE_PER_LEAGUE_DAY", 0.40)  # 40% max per league per calendar day
+
+# ─── RESOLUTION RISK FILTER ──────────────────────────────────────────────────
+# Some markets have elevated chance of UMA resolution disputes. The practitioner
+# cited a NASCAR market that went from $10k to $60k dispute. Skip markets where
+# resolution is likely to be ambiguous.
+RESOLUTION_RISK_FILTER_ENABLED = _bool("RESOLUTION_RISK_FILTER_ENABLED", True)
+# Sports where resolution is more ambiguous than mainstream leagues:
+# - NASCAR: cautions, pit penalties, position disputes
+# - MMA/boxing: split decisions, no-contests
+# - Tennis: retirement rules vary
+# - Golf: weather suspensions, playoff rules
+RESOLUTION_RISK_SPORTS = {"nascar", "mma", "boxing", "tennis", "golf"}
+# Specific market keywords that historically trigger disputes
+RESOLUTION_RISK_KEYWORDS = {
+    "retire", "walkover", "forfeit", "disqualif", "technical",
+    "suspended", "abandoned", "weather", "dnf",
+}
 
 # ─── LIQUIDITY ───────────────────────────────────────────────────────────────
 MIN_MARKET_LIQUIDITY = _flt("MIN_MARKET_LIQUIDITY", 500)

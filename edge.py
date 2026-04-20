@@ -31,6 +31,7 @@ from config import (
     POLY_STALE_QUOTE_SEC, POLY_STALE_PENALTY,
     MAX_TOTAL_EXPOSURE_PCT, MAX_OPEN_POSITIONS, STARTING_BANKROLL,
     EDGE_FEE_AWARE, POLYMARKET_FEE_COEFFICIENT, POLYMARKET_SLIPPAGE_BUFFER,
+    RESOLUTION_RISK_FILTER_ENABLED, RESOLUTION_RISK_SPORTS, RESOLUTION_RISK_KEYWORDS,
 )
 from harvest import _market_is_stale
 
@@ -53,6 +54,23 @@ def net_edge_after_costs(raw_edge: float, price: float) -> float:
     if not EDGE_FEE_AWARE:
         return raw_edge
     return raw_edge - poly_taker_fee_rate(price) - POLYMARKET_SLIPPAGE_BUFFER
+
+
+def resolution_risk_check(sport: str, market_question: str) -> tuple:
+    """Check if a market has elevated resolution risk.
+    Returns (is_risky: bool, reason: str).
+    When risky, caller should skip the trade to avoid UMA dispute exposure.
+    """
+    if not RESOLUTION_RISK_FILTER_ENABLED:
+        return False, ""
+    sport_lower = (sport or "").lower()
+    if sport_lower in RESOLUTION_RISK_SPORTS:
+        return True, f"sport '{sport_lower}' has elevated dispute risk"
+    q_lower = (market_question or "").lower()
+    for kw in RESOLUTION_RISK_KEYWORDS:
+        if kw in q_lower:
+            return True, f"market question contains risky keyword '{kw}'"
+    return False, ""
 
 logger = logging.getLogger("edge")
 
@@ -252,6 +270,14 @@ async def scan_edge(
                 if last_exit and (time.time() - last_exit) < EDGE_REENTRY_COOLDOWN_MIN * 60:
                     diag["skipped_reentry_cooldown"] = diag.get("skipped_reentry_cooldown", 0) + 1
                     continue
+
+            # Resolution-risk filter (v22): skip dispute-prone markets.
+            # NASCAR / MMA / tennis / golf have elevated UMA dispute history.
+            # Market questions mentioning "retire", "walkover", etc. flag risk.
+            is_risky, risk_reason = resolution_risk_check(sport, parsed.get("question", ""))
+            if is_risky:
+                diag["skipped_resolution_risk"] = diag.get("skipped_resolution_risk", 0) + 1
+                continue
 
             hi = parsed["_home_idx"]
             ai = parsed["_away_idx"]
